@@ -1,7 +1,7 @@
 import numpy as np
 import json
 from utils.viz import print_vessel
-from utils.dataset import total_containers, remaining_PODs
+from utils.vessel import total_containers, remaining_PODs, if_discharge, discharge, undischarge
 
 # 装入箱子, TODO 从 current port = 0 开始放, current port 逐步增加
 def CSP(vessel, container_queue):
@@ -81,16 +81,74 @@ def cal_candidates(vessel):
 
     return cands
 
+def solve(vessel, current_POL, container_queue):
+    """
+    统一大递归，管装载和换港
+    - 装载：调用 CSP 在当前港放箱子
+    - 换港：discharge 当前港，递归进入 current_POL + 1
+    """
+    # 终止条件：所有港口都过完了
+    if current_POL > max(container_queue.keys()):
+        return total_containers(container_queue) == 0
+
+    # 触发 discharge：当前港装完，推进到下一港
+    if if_discharge(current_POL, container_queue):
+        
+        discharged = discharge(vessel, current_POL+1)
+        print(f"[discharge] POL={current_POL}, 卸了{len(discharged)}个箱子，推进到POL={current_POL+1}")
+        print_vessel(vessel)
+
+        if solve(vessel, current_POL + 1, container_queue):
+            return True
+
+        # 下一港失败，还原 discharge，回到当前港继续枚举
+        undischarge(vessel, discharged)
+        return False
+
+    # 当前港还有箱子，执行一步装载决策
+    current_candidates = cal_candidates(vessel)
+    avail_PODs = remaining_PODs(container_queue, current_POL)  # 只看当前港剩余
+    
+    choices = {}
+    for idx in np.ndindex(vessel.shape):
+        if vessel[idx] != -1:
+            continue
+        valid = current_candidates[idx] & avail_PODs
+        if not valid:
+            return False  # dead slot → 回溯
+        choices[idx] = valid
+
+    if not choices:
+        return False  # 无空位但当前港还有箱子
+
+    # MRV
+    pos = min(choices, key=lambda p: len(choices[p]))
+
+    for POD in sorted(choices[pos]):
+        if container_queue.get(current_POL, {}).get(POD, 0) == 0:
+            continue
+
+        vessel[pos] = POD
+        container_queue[current_POL][POD] -= 1
+
+        if solve(vessel, current_POL, container_queue):
+            return True
+
+        vessel[pos] = -1
+        container_queue[current_POL][POD] += 1
+
+    return False
+
 if __name__ == "__main__":
-    NUM_PORT = 5 # 0,1,2,3,4港口
-    with open("test.json", encoding="utf-8") as f:
+    NUM_PORT = 4 # 0,1,2,3,4港口
+    with open("data/test_data_1.json", encoding="utf-8") as f:
         data = json.load(f)
 
     vessel = np.array(data["init"], dtype=int)    # 直接就是 4×2×2 的嵌套 list
     print("init:")
     print_vessel(vessel)
-    print("Candidates of init:")
-    print_vessel(cal_candidates(vessel))
+    # print("Candidates of init:")
+    # print_vessel(cal_candidates(vessel))
 
     # POL = Port of Loading 出发，POD = Port of Discharge 终点
     cbf = {
@@ -98,10 +156,10 @@ if __name__ == "__main__":
         for POL, POD in data["cbf"].items()
     }
     # print(cbf)
-    container_queue = cbf
-    # print(total_containers(container_queue))
+    # print(total_containers(cbf))
 
-    if CSP(vessel, container_queue):
+    if solve(vessel, 0, cbf):
+        print("final:")
         print_vessel(vessel)
     else:
         print("didn't find a solution!")
