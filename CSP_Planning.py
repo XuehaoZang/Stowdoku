@@ -81,12 +81,15 @@ def cal_candidates(vessel):
 
     return cands
 
-def solve(vessel, current_POL, container_queue):
+def solve(vessel, current_POL, container_queue, is_debug=False, snapshots=None):
     """
     统一大递归，管装载和换港
     - 装载：调用 CSP 在当前港放箱子
     - 换港：discharge 当前港，递归进入 current_POL + 1
     """
+    if snapshots is None:
+        snapshots = {}
+        
     # 终止条件：所有港口都过完了
     if current_POL > max(container_queue.keys()):
         return total_containers(container_queue) == 0
@@ -94,15 +97,29 @@ def solve(vessel, current_POL, container_queue):
     # 触发 discharge：当前港装完，推进到下一港
     if if_discharge(current_POL, container_queue):
         
-        discharged = discharge(vessel, current_POL+1)
-        print(f"[discharge] POL={current_POL}, 卸了{len(discharged)}个箱子，推进到POL={current_POL+1}")
-        print_vessel(vessel)
+        snapshots[current_POL] = vessel.copy()  # departure 快照
+        
+        next_POL = current_POL + 1
+        discharged = discharge(vessel, next_POL)
+        
+        if is_debug:
+            print(f"[Departure] 从 POL={current_POL} 出发状态:")  # 改这里
+            print_vessel(vessel)
+            print("=" * 30)
+            print(f"[Arrive] 到达 POL={next_POL}")
+            print(f"[Discharge] 卸了 {len(discharged)} 个 POD={next_POL} 的箱子")
+            print_vessel(vessel)
+            print(f"[Loading] 开始装 POL={next_POL} 的箱子")
 
-        if solve(vessel, current_POL + 1, container_queue):
+        if solve(vessel, next_POL, container_queue, is_debug, snapshots):
             return True
 
         # 下一港失败，还原 discharge，回到当前港继续枚举
         undischarge(vessel, discharged)
+        del snapshots[current_POL]
+        
+        if is_debug:
+            print(f"[Undo discharge] POL={next_POL} 失败，回溯还原到 POL={current_POL}")
         return False
 
     # 当前港还有箱子，执行一步装载决策
@@ -131,7 +148,7 @@ def solve(vessel, current_POL, container_queue):
         vessel[pos] = POD
         container_queue[current_POL][POD] -= 1
 
-        if solve(vessel, current_POL, container_queue):
+        if solve(vessel, current_POL, container_queue, is_debug, snapshots):
             return True
 
         vessel[pos] = -1
@@ -140,13 +157,12 @@ def solve(vessel, current_POL, container_queue):
     return False
 
 if __name__ == "__main__":
-    NUM_PORT = 4 # 0,1,2,3,4港口
-    with open("data/test_data_1.json", encoding="utf-8") as f:
+    NUM_PORT = 5 # 0,1,2,3,4港口
+    with open("data/test_data_3.json", encoding="utf-8") as f:
         data = json.load(f)
 
     vessel = np.array(data["init"], dtype=int)    # 直接就是 4×2×2 的嵌套 list
-    print("init:")
-    print_vessel(vessel)
+    
     # print("Candidates of init:")
     # print_vessel(cal_candidates(vessel))
 
@@ -158,8 +174,15 @@ if __name__ == "__main__":
     # print(cbf)
     # print(total_containers(cbf))
 
-    if solve(vessel, 0, cbf):
-        print("final:")
+    snapshots={}
+    if solve(vessel, 0, cbf, is_debug=False, snapshots=snapshots):
+        print("\n-------- [Final Solution] --------")
+        print("[init] 从 POL=0  初始化状态:")
+        print_vessel(np.array(data["init"], dtype=int))
+        for POL in sorted(snapshots.keys()):
+            print(f"[departure] POL={POL} 出发状态:")
+            print_vessel(snapshots[POL])
+        print(f"[final] 最终到达状态:")
         print_vessel(vessel)
     else:
-        print("didn't find a solution!")
+        print("\n-------- [No Solution Found] --------")

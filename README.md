@@ -30,6 +30,30 @@
 
 ### Dataset 设计
 1. 完全装满16个位置，有0->1, 0->2, 1->3，必须需要学习到2要提前竖着放而不能平放，否则在港口1装1->3的时候会导致翻箱
+测试结果
+```text
+init:
+bay0 | bay1 | bay2 | bay3
+ 1  X |  X  X |  X  X |  X  X
+ X  X |  X  X |  X  2 |  X  X
+
+[Departure] from POL=0 出发状态:
+bay0 | bay1 | bay2 | bay3
+ 1  1 |  1  1 |  1  2 |  2  2
+ 1  1 |  1  1 |  1  2 |  2  2
+
+[Arrive] at POL=1, 卸了10个箱子，推进到POL=1
+[Departure] from POL=1 出发状态:
+bay0 | bay1 | bay2 | bay3
+ 3  3 |  3  3 |  3  2 |  2  2
+ 3  3 |  3  3 |  3  2 |  2  2
+
+[Arrive] at POL=2, 卸了6个箱子，推进到POL=2
+final:
+bay0 | bay1 | bay2 | bay3
+ 3  3 |  3  3 |  3  X |  X  X
+ 3  3 |  3  3 |  3  X |  X  X
+```
 
 2. 基于1，引入了4个空位。
 
