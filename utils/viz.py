@@ -1,22 +1,39 @@
 
-def print_vessel(vessel):
-    '''
-    横向并排打印所有 bay，每个 bay 的列用空格分隔，bay 之间用 | 分隔
-    bay0       | bay1       | bay2       | bay3
-    -1  1      | -1 -1      | -1 -1      | -1 -1    ← tier 1 (上层)
-    -1 -1      | -1 -1      |  2 -1      | -1 -1    ← tier 0 (下层)
-    '''
-    n_bay, n_row, n_tier = vessel.shape
-    header = " | ".join(f"bay {b:<6}" * 1 for b in range(n_bay)) 
-    col_w = n_row * 2  # 每个 bay 占的字符宽度估算
-    titles = [f"bay{b}".center(col_w) for b in range(n_bay)]
-    print(" | ".join(titles))
-
-    for t in range(n_tier - 1, -1, -1):
-        row_parts = []
-        for b in range(n_bay):
-            cells = [(" X" if vessel[b][r][t] == -1 else f"{str(vessel[b][r][t]):>2}") for r in range(n_row)]
-            row_parts.append(" ".join(cells))
-        print(" | ".join(row_parts))
+def print_vessel(snap: dict):
+    """
+    打印田字格，每个bay：
+        left  right
+deck:    X     X
+hold:    X     X
+    """
+    if isinstance(snap, dict):
+        pod_arr   = snap["vessel_pod"]
+        type_arr  = snap["vessel_type"]
+        n_bay     = pod_arr.shape[0]
+        valid_arr = None
+    else:
+        pod_arr   = snap.vessel_pod
+        type_arr  = snap.vessel_type
+        n_bay     = snap.n_bay
+        valid_arr = snap.is_valid
+ 
+    def cell_str(bay, lr, hd):
+        if valid_arr is not None and not valid_arr[bay, lr, hd]:
+            return " X "
+        pod = pod_arr[bay, lr, hd]
+        if pod == -1:
+            return " □ "
+        suffix = "*" if type_arr[bay, lr, hd] == "RF" else " "
+        return f"{pod:2}{suffix}"
+ 
+    headers = [f"  bay{b}  ".center(11) for b in range(n_bay)]
+    print("        " + " | ".join(headers))
+ 
+    for hd, hd_label in [(1, "deck"), (0, "hold")]:
+        parts = []
+        for bay in range(n_bay):
+            left  = cell_str(bay, 0, hd)
+            right = cell_str(bay, 1, hd)
+            parts.append(f"  {left}  {right}  ")
+        print(f"{hd_label:>6} " + " | ".join(parts))
     print()
-       

@@ -18,9 +18,9 @@ def if_discharge(current_POL, container_queue):
 
 def discharge(vessel, current_POL):
     """
-    卸货：把 vessel 里所有 == current_POL 的箱子移走（置为 -1）
+    卸货：把 vessel 里所有 POD == current_POL 的箱子移走（置为 -1）
     返回卸货记录，用于回溯还原
-    记录格式：[(idx, POL), ...]
+    记录格式：[(idx, POD), ...]
     """
     discharged = []
     for idx in np.ndindex(vessel.shape):
@@ -33,5 +33,5 @@ def undischarge(vessel, discharged):
     """
     回溯还原 discharge，把 discharged 记录里的箱子放回 vessel
     """
-    for idx, POL in discharged:
-        vessel[idx] = POL
+    for idx, POD in discharged:
+        vessel[idx] = POD
