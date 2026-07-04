@@ -49,7 +49,7 @@ hold:    X     X
 def _default_port_colors(pod_values):
     """按出现的POD值自动分配颜色（tab20色板），避免硬编码港口数量。"""
     unique_pods = sorted(pod_values)
-    cmap = cm.get_cmap("tab20", max(len(unique_pods), 1))
+    cmap = plt.get_cmap("tab20", max(len(unique_pods), 1))
     return {pod: cmap(i) for i, pod in enumerate(unique_pods)}
 
 

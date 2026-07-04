@@ -30,6 +30,7 @@ CBF_DIR = "data/STSE/cbf"
 CBF_JSON = os.path.join(CBF_DIR, "cbf.json")
 BAYPLAN_DIR = "data/STSE/bayplan"
 
+# TODO debug 现在run不起来，缺少TXG的cbf数据
 # TODO: 反转utils.vessel_io.STSE_PORT_MAP填这里，比如 {0:"SHP",1:"TXG",...}
 PORT_NAMES = None
 
@@ -65,8 +66,8 @@ def main():
     geometry_dir = ensure_geometry()
     cbf_json_path = ensure_cbf()
 
-    vessel = Vessel.load_vessel(geometry_dir, cbf_json_path, current_pol=0)
-    exit()
+    vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
+
     snapshots = {}
     success = solve(vessel, is_debug=False, snapshots=snapshots)
 

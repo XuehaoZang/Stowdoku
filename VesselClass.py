@@ -3,7 +3,8 @@ import json
 import numpy as np
 import pandas as pd
 import copy
-from utils.vessel_io import N_BAY, STSE_BAY_PAIRS, BAYPLAN_COLUMNS, _BIG_BAY_OF_B0
+from utils.vessel_io import N_BAY, STSE_BAY_PAIRS, BAYPLAN_COLUMNS
+from utils.vessel_io import _BIG_BAY_OF_B0
 
 
 class Vessel:
@@ -78,13 +79,15 @@ class Vessel:
     # ── 构造 ───────────────────────────────────────────────────────────
 
     @classmethod
-    def load_vessel(cls, geometry_dir: str, cbf_json_path: str, current_pol: int = 0) -> "Vessel":
+    def load_vessel(cls, geometry_dir: str, cbf_json_path: str, current_pol: int = None) -> "Vessel":
         """
         从真实船型数据构造Vessel。
         geometry_dir: 含 full_slot_table.csv 的目录
                       （vessel_io.build_vessel_geometry + find_can_40ft/20ft/reefer 之后落盘的产物，
                        已含 bay_idx/row_idx/tier_idx/lr/hd/can_40ft/can_20ft/can_reefer 列）
         cbf_json_path: cbf.json路径（vessel_io.batch_parse_cbf产出，json的key是字符串，这里转回int）
+        current_pol: 不传则用cbf里最小的POL作为起始港口（cbf本身决定航次从哪个港开始，
+                     不应该由调用方硬编码猜测，避免像POL从1而非0开始时KeyError）
         """
         slots = pd.read_csv(os.path.join(geometry_dir, "full_slot_table.csv"))
 
@@ -94,6 +97,9 @@ class Vessel:
             int(pol): {int(pod): counts for pod, counts in pod_counts.items()}
             for pol, pod_counts in raw_cbf.items()
         }
+
+        if current_pol is None:
+            current_pol = min(cbf.keys())
 
         return cls(full_slot_table=slots, cbf=cbf, current_pol=current_pol)
 
@@ -235,7 +241,9 @@ class Vessel:
     def proj_vessel_to_cell(slots: pd.DataFrame):
         """
         slot级 -> cell级(N_BAY,2,2)投影。
-        要求slots已含can_40ft/can_reefer列，返回 (is_valid, capacity_total, capacity_rf)。
+        要求slots已含can_40ft/can_reefer列（build_vessel_geometry + find_can_40ft +
+        find_can_reefer之后的产物），聚合出Vessel构造需要的三个静态几何数组。
+        返回 (is_valid, capacity_total, capacity_rf)。
         """
         capacity_total = Vessel.build_vessel_cell(slots, "can_40ft")
         is_valid = capacity_total > 0
@@ -246,10 +254,16 @@ class Vessel:
 
     def proj_cell_to_vessel(self, cell_state=None) -> pd.DataFrame:
         """
-        cell级解 -> slot级DataFrame投影。
-        cell_state: 不传则用当前self.cell；传则接受snapshot()格式的dict。
+        cell级解 -> slot级DataFrame投影（proj_vessel_to_cell的逆方向）。
+        cell_state: 不传则用当前self.cell；传则接受snapshot()格式的dict（取其"cell"）。
 
         返回列：bay_idx, row_idx, tier_idx, lr, hd, can_40ft, can_20ft, POL, POD, type
+        POL是该cell实际装货时的current_pol（assign()时精确记录），不是快照所属港口，
+        两者在同一份snapshot里可能不同（更早港口装、还未卸的货会保留原始POL）。
+
+        can_40ft只标在每对STSE_BAY_PAIRS的b0一侧（见vessel_io.find_can_40ft），
+        一个40ft箱物理上同时占用b0和b1两侧的槽位，所以每个cell的解要同时写回
+        b0侧can_40ft=True的行，以及b1侧(row_idx,tier_idx)相同的对应行。
         """
         if self.full_slot_table is None:
             raise ValueError("此Vessel无full_slot_table，无法投影，需通过Vessel.load_vessel()构造")
@@ -300,6 +314,10 @@ class Vessel:
         存成{POL}_{港口码}_DEP_bayplan.csv，同时调用utils.viz.plot_bayplan画一张png，
         都落盘到out_dir，返回写出的文件路径列表（csv和png交替）。
         port_names: 可选{POL: 三字码}，不传则用POL数字编号命名。
+
+        导出前先打印各POL剩余的cbf（GP/RF计数非0的部分），纯诊断信息：
+        可能是capacity取整产生的余量（正数=没放完，负数=capacity超出实际需求的超额扣减），
+        不影响已完成的求解结果，也不在这里做任何修正。
         """
         print("[export_bayplan] 各POL剩余cbf（0表示刚好分配完）：")
         for pol, pod_counts in sorted(self.cbf.items()):
@@ -309,12 +327,12 @@ class Vessel:
             }
             if leftover:
                 print(f"  POL={pol}: {leftover}")
- 
+
         from utils.viz import plot_bayplan, _default_port_colors
- 
+
         os.makedirs(out_dir, exist_ok=True)
         paths = []
- 
+
         # 所有港口共用一套POD颜色映射，方便跨港口对比同一POD在不同图里颜色一致
         all_pods = set()
         for snap in snapshots.values():
@@ -322,20 +340,20 @@ class Vessel:
                 if record["POD"] != -1:
                     all_pods.add(record["POD"])
         port_colors = _default_port_colors(all_pods)
- 
+
         for pol in sorted(snapshots.keys()):
             code = port_names.get(pol, str(pol)) if port_names else str(pol)
             df = self.proj_cell_to_vessel(cell_state=snapshots[pol])
- 
+
             csv_path = os.path.join(out_dir, f"{pol}_{code}_DEP_bayplan.csv")
             df.to_csv(csv_path, index=False)
             paths.append(csv_path)
- 
+
             png_path = plot_bayplan(
                 df, title=f"POL={pol} ({code}) departure",
                 filename=f"{pol}_{code}_DEP_bayplan.png",
                 save_dir=out_dir, port_colors=port_colors,
             )
             paths.append(png_path)
- 
+
         return paths
