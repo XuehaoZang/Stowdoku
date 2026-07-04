@@ -1,9 +1,9 @@
 """
 build_dataset.py
 
-数据准备入口，跑一次、落盘、solver复用。
+数据准备入口，跑一次、落盘、solver复用。这次只做两块：
     1. geometry: STSE_slots_idx.csv -> is_valid/capacity_total/capacity_rf + 完整slot表
-    2. init:     空船初始状态
+    2. init:     空船初始状态（0行bayplan schema）
     3. cbf:      批量解析.cbf原始文件 -> 按POL编号的汇总csv
 ASC解析这次不跑（batch_parse_asc已经在utils/vessel_io.py里，需要时单独调用）。
 """
@@ -55,8 +55,8 @@ def build_cbf():
     if not os.path.isdir(CBF_RAW_DIR):
         print(f"[cbf] 跳过: {CBF_RAW_DIR} 不存在")
         return
-    batch_parse_cbf(CBF_RAW_DIR, CBF_DIR)
-    print(f"[cbf] 已解析 {CBF_RAW_DIR} -> {CBF_DIR}")
+    cbf = batch_parse_cbf(CBF_RAW_DIR, CBF_DIR)
+    print(f"[cbf] 已解析 {CBF_RAW_DIR} -> {CBF_DIR}/cbf.json (POL: {sorted(cbf.keys())})")
 
 
 if __name__ == "__main__":

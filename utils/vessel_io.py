@@ -19,6 +19,7 @@ bay映射（真实物理 -> 0-base idx）：
 
 import os
 import re
+import json
 import numpy as np
 import pandas as pd
 
@@ -36,7 +37,7 @@ STSE_TIER_LABELS = ["02", "04", "06", "08", "82", "84", "86", "88", "90", "92"]
 STSE_HATCH_SPLIT = 5   # row_idx < 5 -> left, >=5 -> right
 STSE_DECK_TIER = 4     # tier_idx < 4 -> hold, >=4 -> deck
 
-STSE_PORT_MAP = {"SHP": 0, "TXG": 1, "DLC": 2, "LYG": 3, "NGO": 4, "TYO": 5, "YOK": 6, "YKK": 7}
+STSE_PORT_MAP = {"SHP": 0, "TXG": 1, "DLC": 2, "YKK": 3, "NGO": 4, "TYO": 5, "YOK": 6, "LYG": 7}
  
 _ISO_TYPE_HEIGHT = {"GP": 8.5, "HC": 9.5, "RF": 9.5, "HR": 9.5, "FR": 8.5, "FP": 8.5, "OT": 8.5, "TK": 8.5, "TG": 8.5}
  
@@ -162,9 +163,31 @@ def parse_cbf_file(cbf_path) -> pd.DataFrame:
     ]
     return pd.DataFrame(rows, columns=["POD", "length", "type", "count"])
 
+def _bucket_type(box_type):
+    """把箱型归入solver认识的GP/RF两类。RF/HR是冷藏箱归RF，其余(GP/HC/PF/TK/OT/未识别)一律归GP。"""
+    return "RF" if box_type in ("RF", "HR") else "GP"
+
+def cbf_df_to_dict(df: pd.DataFrame) -> dict:
+    """把parse_cbf_file的输出(POD,length,type,count)转成{POD:{"GP":n,"RF":n}}。
+    20ft和40ft按 20ft//2 + 40ft 合并成40ft槽位数(2个20ft算1个大箱)；
+    length='UNKNOWN'(ISO无法识别)的行没法换算，跳过并警告。"""
+    result = {}
+    for pod, group in df.groupby("POD"):
+        totals = {"GP": 0, "RF": 0}
+        for _, row in group.iterrows():
+            if row.length == "UNKNOWN":
+                print(f"警告: POD={pod} type={row.type} length无法识别，count={row['count']}已跳过")
+                continue
+            slots = row["count"] // 2 if row.length == 20 else row["count"]
+            totals[_bucket_type(row.type)] += int(slots)
+        result[int(pod)] = totals
+    return result
+
 def batch_parse_cbf(raw_dir, cbf_dir):
-    """遍历raw_dir下所有.cbf文件，存到cbf_dir，命名规则: {编号}_{POL三字码}_cbf.csv。"""
+    """遍历raw_dir下所有.cbf文件，从文件名取最后一段(空格/下划线分隔)作为POL三字码，
+    查STSE_PORT_MAP编号，汇总成{POL:{POD:{"GP":n,"RF":n}}}，存一份cbf.json。"""
     os.makedirs(cbf_dir, exist_ok=True)
+    cbf = {}
     written = {}
     for fname in os.listdir(raw_dir):
         if not fname.upper().endswith(".CBF"):
@@ -173,15 +196,19 @@ def batch_parse_cbf(raw_dir, cbf_dir):
         if pol_code not in STSE_PORT_MAP:
             print(f"警告: {fname} 文件名末段POL='{pol_code}' 不在STSE_PORT_MAP里，跳过")
             continue
-
+ 
         df = parse_cbf_file(os.path.join(raw_dir, fname))
-        out_name = f"{STSE_PORT_MAP[pol_code]}_{pol_code}_cbf.csv"
-        out_path = os.path.join(cbf_dir, out_name)
-        if pol_code in written:
-            print(f"警告: '{out_name}' 被 {fname} 覆盖（之前来自 {written[pol_code]}）")
-        written[pol_code] = fname
-        df.to_csv(out_path, index=False)
-        
+        pol_num = STSE_PORT_MAP[pol_code]
+        if pol_num in written:
+            print(f"警告: POL={pol_num}({pol_code}) 被 {fname} 覆盖（之前来自 {written[pol_num]}）")
+        written[pol_num] = fname
+        cbf[pol_num] = cbf_df_to_dict(df)
+ 
+    cbf = dict(sorted(cbf.items()))
+    out_path = os.path.join(cbf_dir, "cbf.json")
+    with open(out_path, "w") as f:
+        json.dump(cbf, f, indent=2)
+    return cbf
         
 # ── ASC解析（.ASC原始配载文件 -> bayplan csv） ──────────────────────────
  
