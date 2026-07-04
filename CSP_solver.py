@@ -17,7 +17,7 @@ def cal_candidates(vessel: Vessel) -> dict:
             for hd in range(2):
                 if not vessel.is_valid[bay, lr, hd]:
                     continue
-                if vessel.vessel_pod[bay, lr, hd] != -1:
+                if vessel.cell[bay, lr, hd]["POD"] != -1:
                     continue
                 cands = vessel.get_candidates(bay, lr, hd)
                 if not cands:
@@ -106,27 +106,54 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
 
 
 if __name__ == "__main__":
-    # 复用test_vessel.py里的测试数据
-    is_valid = np.array([
-        [[False,  True], [True,  True]],
-        [[True,  True], [True,  True]],
-        [[True,  True], [True,  True]],
-        [[True,  True], [False, True]],
-    ], dtype=bool)
+    import pandas as pd
 
-    capacity_total = np.array([
-        [[0, 1], [1, 1]],
-        [[1, 1], [1, 1]],
-        [[1, 1], [1, 1]],
-        [[1, 1], [0, 1]],
-    ], dtype=int)
+    def _make_pair_rows(b0, b1, cells):
+        """cells: {(lr,hd): {"capacity": 0或1, "reefer": bool}}。
+        capacity=1时给这对bay各生成一行占位slot，capacity=0则不生成（对应is_valid=False）。"""
+        rows = []
+        for (lr, hd), spec in cells.items():
+            if spec["capacity"] == 0:
+                continue
+            row_idx = 0 if lr == 0 else 5
+            tier_idx = 0 if hd == 0 else 4
+            for bay_idx in (b0, b1):
+                rows.append({
+                    "bay_idx": bay_idx, "row_idx": row_idx, "tier_idx": tier_idx,
+                    "lr": lr, "hd": hd,
+                    "can_40ft": True, "can_20ft": False, "can_reefer": spec["reefer"],
+                })
+        return rows
 
-    capacity_rf = np.array([
-        [[0, 0], [0, 1]],
-        [[0, 0], [0, 0]],
-        [[0, 0], [1, 0]],
-        [[0, 0], [0, 0]],
-    ], dtype=int)
+    # 复现原先4-bay测试场景的is_valid/capacity/reefer分布，
+    # 分别对应STSE_BAY_PAIRS的前4对(2,3)/(4,5)/(6,7)/(8,9)（big_bay 0-3）
+    # 后3对(big_bay 4-6)不给数据，capacity_total=0，永远is_valid=False，不参与搜索
+    rows = []
+    rows += _make_pair_rows(2, 3, {
+        (0, 0): {"capacity": 0, "reefer": False},
+        (0, 1): {"capacity": 1, "reefer": False},
+        (1, 0): {"capacity": 1, "reefer": False},
+        (1, 1): {"capacity": 1, "reefer": True},
+    })
+    rows += _make_pair_rows(4, 5, {
+        (0, 0): {"capacity": 1, "reefer": False},
+        (0, 1): {"capacity": 1, "reefer": False},
+        (1, 0): {"capacity": 1, "reefer": False},
+        (1, 1): {"capacity": 1, "reefer": False},
+    })
+    rows += _make_pair_rows(6, 7, {
+        (0, 0): {"capacity": 1, "reefer": False},
+        (0, 1): {"capacity": 1, "reefer": False},
+        (1, 0): {"capacity": 1, "reefer": True},
+        (1, 1): {"capacity": 1, "reefer": False},
+    })
+    rows += _make_pair_rows(8, 9, {
+        (0, 0): {"capacity": 1, "reefer": False},
+        (0, 1): {"capacity": 1, "reefer": False},
+        (1, 0): {"capacity": 0, "reefer": False},
+        (1, 1): {"capacity": 1, "reefer": False},
+    })
+    full_slot_table = pd.DataFrame(rows)
 
     cbf = {
         0: {
@@ -138,14 +165,8 @@ if __name__ == "__main__":
         },
     }
 
-    vessel = Vessel(is_valid, capacity_total, capacity_rf, cbf, current_pol=0)
+    vessel = Vessel(full_slot_table=full_slot_table, cbf=cbf, current_pol=0)
     vessel_init = copy.deepcopy(vessel)
-
-    # 预装货
-    # vessel.vessel_pod[0, 0, 0] = 1
-    # vessel.vessel_type[0, 0, 0] = "GP"
-    # vessel.vessel_pod[2, 1, 0] = 2
-    # vessel.vessel_type[2, 1, 0] = "GP"
 
     snapshots = {}
     if solve(vessel, is_debug=False, snapshots=snapshots):
