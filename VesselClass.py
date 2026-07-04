@@ -3,7 +3,8 @@ import json
 import numpy as np
 import pandas as pd
 import copy
-from utils.vessel_io import proj_vessel_to_cell
+from utils.vessel_io import N_BAY, STSE_BAY_PAIRS, BAYPLAN_COLUMNS
+from utils.vessel_io import _BIG_BAY_OF_B0
 
 
 class Vessel:
@@ -34,7 +35,7 @@ class Vessel:
         # 派生只在构造时发生一次，之后是普通numpy数组，不影响solve()内层循环的访问速度。
 
         if full_slot_table is not None:
-            is_valid, capacity_total, capacity_rf = proj_vessel_to_cell(full_slot_table)
+            is_valid, capacity_total, capacity_rf = self.proj_vessel_to_cell(full_slot_table)
 
         if is_valid is None or capacity_total is None or capacity_rf is None:
             raise ValueError("必须提供 is_valid/capacity_total/capacity_rf 三个数组，或提供 full_slot_table 由其派生")
@@ -225,8 +226,9 @@ class Vessel:
                         result[(bay, lr, hd)] = (pod, self.vessel_type[bay, lr, hd])
         return result
 
+    @staticmethod
     def build_vessel_cell(slots: pd.DataFrame, flag_col: str) -> np.ndarray:
-        """把slots按flag_col筛选后，聚合成(7,2,2)的cell田字格。
+        """把slots按flag_col筛选后，聚合成(N_BAY,2,2)的cell田字格。
         """
         cell = np.zeros((N_BAY, 2, 2), dtype=int)
         hits = slots[slots[flag_col]]
@@ -237,10 +239,12 @@ class Vessel:
             cell[big_bay, lr, hd] += 1
         return cell
 
+    @staticmethod
     def build_init_state(slots: pd.DataFrame) -> pd.DataFrame:
         """空船初始状态：船上还没有任何箱子"""
         return pd.DataFrame(columns=BAYPLAN_COLUMNS)
 
+    @staticmethod
     def proj_vessel_to_cell(slots: pd.DataFrame):
         """
         slot级 -> cell级(N_BAY,2,2)投影。
@@ -248,11 +252,11 @@ class Vessel:
         find_can_reefer之后的产物），聚合出Vessel构造需要的三个静态几何数组。
         返回 (is_valid, capacity_total, capacity_rf)。
         """
-        capacity_total = build_vessel_cell(slots, "can_40ft")
+        capacity_total = Vessel.build_vessel_cell(slots, "can_40ft")
         is_valid = capacity_total > 0
         slots = slots.copy()
         slots["can_reefer_40ft"] = slots["can_40ft"] & slots["can_reefer"]
-        capacity_rf = build_vessel_cell(slots, "can_reefer_40ft")
+        capacity_rf = Vessel.build_vessel_cell(slots, "can_reefer_40ft")
         return is_valid, capacity_total, capacity_rf
     
     def proj_cell_to_vessel(self, cell_state: dict = None) -> pd.DataFrame:

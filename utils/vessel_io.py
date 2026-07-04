@@ -118,38 +118,6 @@ def find_can_reefer(slots: pd.DataFrame) -> pd.DataFrame:
     return slots
 
 
-def build_vessel_cell(slots: pd.DataFrame, flag_col: str) -> np.ndarray:
-    """把slots按flag_col筛选后，聚合成(7,2,2)的cell田字格。
-    """
-    cell = np.zeros((N_BAY, 2, 2), dtype=int)
-    hits = slots[slots[flag_col]]
-    for bay_idx, lr, hd in zip(hits.bay_idx, hits.lr, hits.hd):
-        big_bay = _BIG_BAY_OF_B0.get(bay_idx)
-        if big_bay is None:
-            continue
-        cell[big_bay, lr, hd] += 1
-    return cell
-
-def build_init_state(slots: pd.DataFrame) -> pd.DataFrame:
-    """空船初始状态：船上还没有任何箱子"""
-    return pd.DataFrame(columns=BAYPLAN_COLUMNS)
-
-
-def proj_vessel_to_cell(slots: pd.DataFrame):
-    """
-    slot级 -> cell级(N_BAY,2,2)投影。
-    要求slots已含can_40ft/can_reefer列（build_vessel_geometry + find_can_40ft +
-    find_can_reefer之后的产物），聚合出Vessel构造需要的三个静态几何数组。
-    返回 (is_valid, capacity_total, capacity_rf)。
-    """
-    capacity_total = build_vessel_cell(slots, "can_40ft")
-    is_valid = capacity_total > 0
-    slots = slots.copy()
-    slots["can_reefer_40ft"] = slots["can_40ft"] & slots["can_reefer"]
-    capacity_rf = build_vessel_cell(slots, "can_reefer_40ft")
-    return is_valid, capacity_total, capacity_rf
-
-
 # ── CBF解析（.cbf原始货量文件 -> 汇总csv） ───────────────────────────────
  
 _CBF_DATA_LINE_RE = re.compile(r"^46\s+([A-Z]{2}[A-Z]{3})\s+([A-Z0-9]{4})\s+(\d+)")
