@@ -306,23 +306,20 @@ class Vessel:
 
     def proj_cell_to_vessel(self, cell_state=None) -> pd.DataFrame:
         """
-        cell级解 -> slot级DataFrame投影（proj_vessel_to_cell的逆方向）。
+        cell级解 -> slot级DataFrame投影。
         cell_state: 不传则用当前self.cell；传则接受snapshot()格式的dict（取其"cell"）。
 
         返回列：bay_idx, row_idx, tier_idx, lr, hd, can_40ft, can_20ft, can_reefer,
                POL, POD, GP_count, RF_count
-        POL是该cell实际装货时的current_pol（assign()时精确记录），不是快照所属港口，
-        两者在同一份snapshot里可能不同（更早港口装、还未卸的货会保留原始POL）。
 
-        GP_count/RF_count是cell级别的聚合数量，广播到这个cell内所有物理槽位上——
-        我们不知道cell内具体哪几个物理槽位装的是reefer、哪几个是普通箱，只知道
-        这个cell总共装了多少。下游画图时若要判断"这个具体槽位是否显示reefer标记"，
-        应该用can_reefer(这个槽位本身是否有reefer插座) and RF_count>0(这个cell
-        是否用到了reefer)一起判断，而不是假设RF_count个槽位就精确对应真实占用的那几个。
-
-        can_40ft只标在每对STSE_BAY_PAIRS的b0一侧（见vessel_io.find_can_40ft），
-        一个40ft箱物理上同时占用b0和b1两侧的槽位，所以每个cell的解要同时写回
-        b0侧can_40ft=True的行，以及b1侧(row_idx,tier_idx)相同的对应行。
+        分配到具体物理槽位的规则（cell级解 -> slot级的合理近似复原，
+        不是真实精确到箱位的CSP解，只是按装载习惯把cell总量摊到槽位上，
+        摊不满的槽位保持真正的空(POD=-1)，不再用广播制造"整格同色但没装满"的误导）：
+            1. 先摊RF需求：只在can_reefer=True的槽位里，按"从下往上、从中间到两边"
+               的顺序，摊满RF_count个槽位（每个槽位RF_count只会是0或1）。
+            2. 再摊GP需求：在这个cell剩下的所有槽位里（含没被RF用到的reefer槽位），
+               按同样顺序摊满GP_count个槽位。
+            3. 摊不满的槽位，POD保持-1。
         """
         if self.full_slot_table is None:
             raise ValueError("此Vessel无full_slot_table，无法投影，需通过Vessel.load_vessel()构造")
@@ -347,26 +344,56 @@ class Vessel:
                     gp_count = record["GP_count"]
                     rf_count = record["RF_count"]
 
-                    # b0侧：can_40ft标记的行，直接按(lr,hd)取这个cell对应的所有物理槽位
                     b0_mask = b0_can40 & (slots.lr == lr) & (slots.hd == hd)
-                    slots.loc[b0_mask, "POL"] = pol
-                    slots.loc[b0_mask, "POD"] = pod
-                    slots.loc[b0_mask, "GP_count"] = gp_count
-                    slots.loc[b0_mask, "RF_count"] = rf_count
-
-                    # b1侧：同一批40ft箱占用的另一半，(row_idx,tier_idx)与b0侧完全一致
-                    rt_pairs = set(
-                        zip(slots.loc[b0_mask, "row_idx"], slots.loc[b0_mask, "tier_idx"])
-                    )
-                    if not rt_pairs:
+                    cell_idx = list(slots.index[b0_mask])
+                    if not cell_idx:
                         continue
-                    b1_mask = (slots.bay_idx == b1) & slots.apply(
-                        lambda r: (r.row_idx, r.tier_idx) in rt_pairs, axis=1
-                    )
-                    slots.loc[b1_mask, "POL"] = pol
-                    slots.loc[b1_mask, "POD"] = pod
-                    slots.loc[b1_mask, "GP_count"] = gp_count
-                    slots.loc[b1_mask, "RF_count"] = rf_count
+
+                    # 摆放顺序：从下往上(tier_idx升序)、从中间到两边。
+                    # lr=0这一侧假设row_idx越大越靠中线(降序=从中间到两边)，
+                    # lr=1这一侧假设row_idx越小越靠中线(升序=从中间到两边)——
+                    # 如果实际方向反了，把下面row_reverse的条件互换即可。
+                    row_reverse = (lr == 0)
+                    cell_idx.sort(key=lambda idx: (
+                        slots.at[idx, "tier_idx"],
+                        -slots.at[idx, "row_idx"] if row_reverse else slots.at[idx, "row_idx"],
+                    ))
+
+                    # 第一步：只在can_reefer=True的槽位里摊RF需求
+                    reefer_idx = [idx for idx in cell_idx if slots.at[idx, "can_reefer"]]
+                    used_rf_idx = reefer_idx[:rf_count]
+
+                    # 第二步：剩下所有槽位（含没被RF用到的reefer槽位）摊GP需求
+                    remaining_idx = [idx for idx in cell_idx if idx not in used_rf_idx]
+                    used_gp_idx = remaining_idx[:gp_count]
+
+                    for idx in used_rf_idx:
+                        slots.at[idx, "POL"] = pol
+                        slots.at[idx, "POD"] = pod
+                        slots.at[idx, "RF_count"] = 1
+                    for idx in used_gp_idx:
+                        slots.at[idx, "POL"] = pol
+                        slots.at[idx, "POD"] = pod
+                        slots.at[idx, "GP_count"] = 1
+
+                    # b1侧：镜像写回，(row_idx,tier_idx)与b0侧完全一致
+                    used_idx = used_rf_idx + used_gp_idx
+                    if not used_idx:
+                        continue
+                    rt_to_type = {
+                        (slots.at[idx, "row_idx"], slots.at[idx, "tier_idx"]):
+                            ("RF" if idx in used_rf_idx else "GP")
+                        for idx in used_idx
+                    }
+                    for idx in slots.index[slots.bay_idx == b1]:
+                        key = (slots.at[idx, "row_idx"], slots.at[idx, "tier_idx"])
+                        if key in rt_to_type:
+                            slots.at[idx, "POL"] = pol
+                            slots.at[idx, "POD"] = pod
+                            if rt_to_type[key] == "RF":
+                                slots.at[idx, "RF_count"] = 1
+                            else:
+                                slots.at[idx, "GP_count"] = 1
 
         return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
                       "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count"]]

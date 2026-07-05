@@ -62,20 +62,35 @@ def _pod_try_order(cands, vessel, bay, lr, hd):
 
     return sorted(cands, key=key)
 
+def _total_assigned(vessel: Vessel) -> int:
+    """统计当前vessel.cell里已经装了多少箱(GP+RF)，作为"解的完整度"指标。"""
+    total = 0
+    for bay in range(vessel.n_bay):
+        for lr in range(2):
+            for hd in range(2):
+                rec = vessel.cell[bay, lr, hd]
+                if rec["POD"] != -1:
+                    total += rec["GP_count"] + rec["RF_count"]
+    return total
+
 _solve_call_count = [0]
 
-def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
+def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
     """
     统一大递归：装载 + 换港，discharge作为递归中的特殊节点。
     vessel内部维护current_pol和cbf状态。
+    best: dict容器 {"assigned": int, "vessel": Vessel或None}，
+          记录搜索过程中见过的、已装箱数最多的状态快照，用于失败时输出最优近似解。
     """
     _solve_call_count[0] += 1
-    if _solve_call_count[0] % 500 == 0:
-        print(f"[depth debug] 已调用{_solve_call_count[0]}次, current_pol={vessel.current_pol}, "
-              f"total_remaining={vessel.total_remaining()}")
+    # if _solve_call_count[0] % 500 == 0:
+    #     print(f"[depth debug] 已调用{_solve_call_count[0]}次, current_pol={vessel.current_pol}, "
+    #           f"total_remaining={vessel.total_remaining()}")
     
     if snapshots is None:
         snapshots = {}
+    if best is None:
+        best = {"assigned": -1, "vessel": None}
 
     # 终止条件：已超过最后一个港口
     if vessel.current_pol > max(vessel.cbf.keys()):
@@ -88,12 +103,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
         vessel.advance_pol()
         discharged = vessel.discharge(vessel.current_pol)
 
-        if is_debug:
-            print(f"[port snapshot] 到达POL={vessel.current_pol}后，cbf现状：")
-            for pod, counts in sorted(vessel.cbf[vessel.current_pol].items()):
-                print(f"    POD={pod}: {counts}")
-
-        if solve(vessel, is_debug, snapshots):
+        if solve(vessel, is_debug, snapshots, best):
             return True
 
         # 下一港失败，回溯
@@ -113,7 +123,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
     if not choices:
         # 所有空cell的cbf候选都已耗尽，等价于port_complete
         # 下一次递归开头的port_complete()会处理换港
-        return solve(vessel, is_debug, snapshots)
+        return solve(vessel, is_debug, snapshots, best)
 
     # MRV选位置
     pos = mrv_select(choices, vessel)
@@ -122,11 +132,12 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
     for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd):
         vessel.assign(bay, lr, hd, pod)
 
-        if is_debug:
-            record = vessel.cell[bay, lr, hd]
-            print(f"  assign ({bay},{lr},{hd}) POD={pod} GP={record['GP_count']} RF={record['RF_count']}")
+        current_total = _total_assigned(vessel)
+        if current_total > best["assigned"]:
+            best["assigned"] = current_total
+            best["vessel"] = copy.deepcopy(vessel)
 
-        if solve(vessel, is_debug, snapshots):
+        if solve(vessel, is_debug, snapshots, best):
             return True
 
         vessel.unassign(bay, lr, hd, pod)
@@ -198,16 +209,24 @@ if __name__ == "__main__":
     vessel_init = copy.deepcopy(vessel)
 
     snapshots = {}
-    if solve(vessel, is_debug=False, snapshots=snapshots):
+    best = {"assigned": -1, "vessel": None}
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+
+    if success:
         print("\n──── Solution Found ────")
-        print("[init]")
-        print_vessel(vessel_init)  # 初始状态（已是final，仅做参考）
- 
-        for pol in sorted(snapshots.keys()):
-            print(f"[departure] POL={pol} 出发状态:")
-            print_vessel(snapshots[pol])
- 
-        print("[final state]")
-        print_vessel(vessel)
+        result_vessel = vessel
     else:
-        print("No solution found")
+        print("\n──── No Full Solution — 输出搜索过程中最优的近似解 ────")
+        result_vessel = best["vessel"]
+
+    if result_vessel is not None:
+        print(f"共装箱数: {_total_assigned(result_vessel)}")
+        print("剩余cbf（未能装上的部分）：")
+        for pol, pod_dict in sorted(result_vessel.cbf.items()):
+            for pod, counts in sorted(pod_dict.items()):
+                if counts.get("GP", 0) > 0 or counts.get("RF", 0) > 0:
+                    print(f"    POL={pol} POD={pod}: {counts}")
+        print("[final state]")
+        print_vessel(result_vessel)
+    else:
+        print("连一个箱子都没能装上")
