@@ -59,10 +59,10 @@ def phy_to_idx(bay_p, row_p, tier_p):
     return b_idx, r_idx, t_idx
 
 
-def build_vessel_geometry(idx_csv_path) -> pd.DataFrame:
+def build_vessel_geometry(slots_csv_path) -> pd.DataFrame:
     """读取idx版槽位csv，返回完整slot表，不做任何bay过滤。
     列：bay_idx, row_idx, tier_idx, lr, hd"""
-    df = pd.read_csv(idx_csv_path).rename(
+    df = pd.read_csv(slots_csv_path).rename(
         columns={"Bay": "bay_idx", "Row": "row_idx", "Tier": "tier_idx"}
     )
     df["lr"] = (df["row_idx"] >= STSE_HATCH_SPLIT).astype(int)
@@ -110,11 +110,25 @@ def find_can_20ft(slots: pd.DataFrame) -> pd.DataFrame:
     ]
     return slots
 
-
-def find_can_reefer(slots: pd.DataFrame) -> pd.DataFrame:
-    """占位：reefer位置数据未接入，先全部标False。等人工reefer位置数据就绪后重写。"""
+def find_can_reefer(slots: pd.DataFrame, reefer_csv_path) -> pd.DataFrame:
+    """加can_reefer列：读reefer_slots.csv(格式同STSE_slots_idx.csv: Bay,Row,Tier)。"""
     slots = slots.copy()
-    slots["can_reefer"] = False
+    reefer_df = pd.read_csv(reefer_csv_path)
+    reefer_keys = set(map(tuple, reefer_df[["Bay", "Row", "Tier"]].values))
+    keys = list(zip(slots.bay_idx, slots.row_idx, slots.tier_idx))
+    slots["can_reefer"] = [k in reefer_keys for k in keys]
+
+    mirrored = set()
+    for b0, b1 in STSE_BAY_PAIRS:
+        rt0 = set(map(tuple, slots.loc[(slots.bay_idx == b0) & slots.can_reefer, ["row_idx", "tier_idx"]].values))
+        rt1 = set(map(tuple, slots.loc[(slots.bay_idx == b1) & slots.can_reefer, ["row_idx", "tier_idx"]].values))
+        for r, t in rt0 | rt1:
+            mirrored.add((b0, r, t))
+
+    slots["can_reefer"] = slots["can_reefer"] | np.array([
+        (b, r, t) in mirrored for b, r, t in zip(slots.bay_idx, slots.row_idx, slots.tier_idx)
+    ])
+    print(f"[geometry] 已标记 can_reefer槽位（{slots.can_reefer.sum()}个）")
     return slots
 
 

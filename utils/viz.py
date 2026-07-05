@@ -2,7 +2,11 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.lines import Line2D
-from matplotlib import cm
+
+plt.rcParams['font.sans-serif'] = ['SimHei']  # Use a font that supports Chinese characters
+plt.rcParams['axes.unicode_minus'] = False     # Fixes minus sign rendering issues
+plt.rcParams['mathtext.fontset'] = 'cm'
+# TODO error: findfont: Failed to find font weight bold, now using 400.
 
 
 def print_vessel(snap):
@@ -74,7 +78,9 @@ def plot_bayplan(slots, title="bayplan", filename="bayplan.png", save_dir=".", p
     if port_colors is None:
         port_colors = _default_port_colors(assigned_pods)
 
-    bay_ids = sorted(slots["bay_idx"].unique())
+    bay_ids = sorted(slots["bay_idx"].unique(), reverse=True)
+    # 降序排列：大编号在左，Bay01（bay_idx=0）排在最右，对应真实配载图的惯例
+    # （参考真实General Stowage Plan：BAY15→11→07→03→01从左到右递减）
     n_bay = len(bay_ids)
     ncols = min(4, n_bay) if n_bay > 0 else 1
     nrows = max(1, -(-n_bay // ncols))  # ceil division

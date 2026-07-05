@@ -21,8 +21,9 @@ class Vessel:
         hd   : 0=hold(tier 0-3), 1=deck(tier 4-9)
     """
 
-    _EMPTY_RECORD = {"POD": -1, "type": None, "POL": -1}
-    # 未赋值cell的记录模板。注意：每个cell必须持有独立的dict实例，
+    _EMPTY_RECORD = {"POD": -1, "type": None, "POL": -1, "count": 0}
+    # 未赋值cell的记录模板。count=实际装的箱量（<=capacity，never超装）。
+    # 注意：每个cell必须持有独立的dict实例，
     # 不能用np.full(shape, {...})批量填充——那样所有cell会共享同一个dict对象，
     # 改一个牵动全部。__init__里逐个构造。
 
@@ -156,16 +157,24 @@ class Vessel:
     # ── 赋值与撤销 ─────────────────────────────────────────────────────
 
     def assign(self, bay, lr, hd, pod, ctype):
-        """赋值cell，同步扣减cbf，记录装货港current_pol。ctype='GP'扣capacity_total，'RF'扣capacity_rf。"""
-        self.cell[bay, lr, hd] = {"POD": pod, "type": ctype, "POL": self.current_pol}
+        """
+        赋值cell，记录装货港current_pol。
+        扣减cbf时取min(capacity, 当前剩余量)——容量再大也不能超装，
+        剩余量不够填满整个cell时就按实际剩余量装，cbf扣到0为止，不会变负数。
+        实际装的箱量记在cell的"count"字段里，unassign时精确按这个数值加回，
+        不能重新用capacity推算（因为可能小于capacity）。
+        """
         cap = self.capacity_rf[bay, lr, hd] if ctype == "RF" else self.capacity_total[bay, lr, hd]
-        self.cbf[self.current_pol][pod][ctype] -= cap
+        remaining = self.cbf[self.current_pol][pod][ctype]
+        used = min(cap, remaining)
+        self.cell[bay, lr, hd] = {"POD": pod, "type": ctype, "POL": self.current_pol, "count": used}
+        self.cbf[self.current_pol][pod][ctype] = remaining - used
 
     def unassign(self, bay, lr, hd, pod, ctype):
-        """撤销赋值，精确恢复cbf。"""
+        """撤销赋值，把cell记录里实际装的count加回cbf（不是capacity），精确恢复。"""
+        used = self.cell[bay, lr, hd]["count"]
+        self.cbf[self.current_pol][pod][ctype] += used
         self.cell[bay, lr, hd] = dict(self._EMPTY_RECORD)
-        cap = self.capacity_rf[bay, lr, hd] if ctype == "RF" else self.capacity_total[bay, lr, hd]
-        self.cbf[self.current_pol][pod][ctype] += cap
 
     # ── 多港口 ─────────────────────────────────────────────────────────
 
@@ -209,7 +218,8 @@ class Vessel:
 
     def export_cell_state(self) -> dict:
         """导出已赋值cell的状态，供viz展开到slot层面。
-        返回 {(bay, lr, hd): {"POD":.., "type":.., "POL":..}}，只含POD != -1的cell。"""
+        返回 {(bay, lr, hd): {"POD":.., "type":.., "POL":.., "count":..}}，只含POD != -1的cell。
+        count是实际装的箱量（<=capacity，不一定填满整个cell）。"""
         result = {}
         for bay in range(self.n_bay):
             for lr in range(2):

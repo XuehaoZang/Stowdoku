@@ -3,7 +3,7 @@ main.py - 编排入口，负责数据准备 + 求解 + 导出的完整流水线
 
 数据准备（若目标文件已存在则跳过，不重复构建）：
     1. geometry: 若 GEOMETRY_DIR/full_slot_table.csv 不存在，
-       从 GEOMETRY_IDX_CSV 解析 + find_can_40ft/20ft/reefer 后落盘
+       从 GEOMETRY_ALL_CSV 解析 + find_can_40ft/20ft/reefer 后落盘
     2. cbf:      若 CBF_JSON 不存在，从 CBF_RAW_DIR 批量解析 .cbf 文件后落盘
 
 求解：
@@ -23,7 +23,8 @@ from utils.vessel_io import (
 from VesselClass import Vessel
 from CSP_solver import solve
 
-GEOMETRY_IDX_CSV = "data/STSE/geometry/STSE_slots_idx.csv"
+GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
+GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
 GEOMETRY_DIR = "data/STSE/geometry"
 CBF_RAW_DIR = "data/STSE/raw"
 CBF_DIR = "data/STSE/cbf"
@@ -41,10 +42,10 @@ def ensure_geometry() -> str:
     if os.path.exists(out_path):
         return GEOMETRY_DIR
 
-    slots = build_vessel_geometry(GEOMETRY_IDX_CSV)
+    slots = build_vessel_geometry(GEOMETRY_ALL_CSV)
     slots = find_can_40ft(slots)
     slots = find_can_20ft(slots)
-    slots = find_can_reefer(slots)
+    slots = find_can_reefer(slots, GEOMETRY_REEFER_CSV)
 
     os.makedirs(GEOMETRY_DIR, exist_ok=True)
     slots.to_csv(out_path, index=False)
@@ -67,7 +68,7 @@ def main():
     cbf_json_path = ensure_cbf()
 
     vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
-
+    exit()
     snapshots = {}
     success = solve(vessel, is_debug=False, snapshots=snapshots)
 
