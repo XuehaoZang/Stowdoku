@@ -74,6 +74,13 @@ class Vessel:
         self.cbf = cbf
         # 全航次cbf，格式：{POL: {POD: {"GP": count, "RF": count}}}
         # 内部通过current_pol指针取当前港口的切片，不在换港时替换整个dict
+        
+        all_ports = set(self.cbf.keys())
+        for pod_counts in self.cbf.values():
+            all_ports.update(pod_counts.keys())
+        self.port_min = min(all_ports)
+        self.port_max = max(all_ports)
+        self.n_ports = self.port_max - self.port_min + 1
 
         self.current_pol = current_pol
         # 当前装载港口编号，指向cbf的第一层key
@@ -119,22 +126,29 @@ class Vessel:
 
         current_cbf = self.cbf[self.current_pol]  # {POD: {"GP": n, "RF": n}}
 
-        # 第一层：no-overstow，同一(bay, lr)的hold/deck POD约束
+        def rel_rank(pod):
+            """相对current_pol的挂靠距离，允许绕圈（用port_min把港口范围平移到0起点）。"""
+            c = (self.current_pol - self.port_min) % self.n_ports
+            p = (pod - self.port_min) % self.n_ports
+            return (p - c) if p >= c else (p - c + self.n_ports)
+
+        # 第一层：no-overstow，同一(bay, lr)的hold/deck POD约束，用相对距离比较
         other_hd = 1 - hd
         other_pod = self.cell[bay, lr, other_hd]["POD"]
-
-        pod_lo, pod_hi = 0, max(current_cbf.keys()) if current_cbf else 0
-        if other_pod != -1:
-            if hd == 0:   # 当前是hold，必须 >= deck的POD
-                pod_lo = other_pod
-            else:          # 当前是deck，必须 <= hold的POD
-                pod_hi = other_pod
+        other_rank = rel_rank(other_pod) if other_pod != -1 else None
 
         # 第二层：capabilities + 第三层：cbf余量，同时过滤
         candidates = set()
         for pod, counts in current_cbf.items():
-            if not (pod_lo <= pod <= pod_hi):
-                continue
+            if other_rank is not None:
+                new_rank = rel_rank(pod)
+                if hd == 0:        # 当前是hold，必须比deck的货晚卸（距离≥）
+                    if new_rank < other_rank:
+                        continue
+                else:              # 当前是deck，必须比hold的货早卸（距离≤）
+                    if new_rank > other_rank:
+                        continue
+
             has_gp_demand = counts.get("GP", 0) > 0
             has_rf_demand = self.has_reefer[bay, lr, hd] and counts.get("RF", 0) > 0
             if has_gp_demand or has_rf_demand:
@@ -188,6 +202,10 @@ class Vessel:
         self.cbf[self.current_pol][pod]["RF"] = rf_remaining - rf_used
         self.cbf[self.current_pol][pod]["GP"] = gp_remaining - gp_used
 
+        # print(f"[assign] POL={self.current_pol} POD={pod} cell=({bay},{lr},{hd}) "
+        #       f"装GP={gp_used} 装RF={rf_used}  →  剩余cbf[POD={pod}]="
+        #       f"{self.cbf[self.current_pol][pod]}")
+        
     def unassign(self, bay, lr, hd, pod):
         """撤销赋值，把cell记录里实际用掉的GP_count/RF_count分别加回cbf，精确恢复。"""
         record = self.cell[bay, lr, hd]
@@ -200,12 +218,18 @@ class Vessel:
     def discharge(self, arriving_pod) -> list:
         """卸载arriving_pod的所有cell，返回记录供undischarge回溯。"""
         discharged = []
+        total_gp, total_rf = 0, 0
         for bay in range(self.n_bay):
             for lr in range(2):
                 for hd in range(2):
                     if self.cell[bay, lr, hd]["POD"] == arriving_pod:
-                        discharged.append((bay, lr, hd, dict(self.cell[bay, lr, hd])))
+                        record = self.cell[bay, lr, hd]
+                        total_gp += record["GP_count"]
+                        total_rf += record["RF_count"]
+                        discharged.append((bay, lr, hd, dict(record)))
                         self.cell[bay, lr, hd] = dict(self._EMPTY_RECORD)
+        # print(f"[discharge] POD={arriving_pod} 到港：卸了{len(discharged)}个cell，"
+        #       f"共GP={total_gp} RF={total_rf}")
         return discharged
 
     def undischarge(self, discharged: list):
@@ -396,3 +420,19 @@ class Vessel:
             paths.append(png_path)
 
         return paths
+    
+    def verify_reefer_allocation(vessel, snapshots):
+        for pol, snap in sorted(snapshots.items()):
+            cell = snap["cell"]
+            total_rf_used = sum(
+                cell[b, l, h]["RF_count"]
+                for b in range(vessel.n_bay) for l in range(2) for h in range(2)
+            )
+            total_rf_capacity = sum(
+                vessel.capacity_rf[b, l, h]
+                for b in range(vessel.n_bay) for l in range(2) for h in range(2)
+                if cell[b, l, h]["POD"] != -1  # 只统计已赋值的cell
+            )
+            print(f"POL={pol}: RF实际用量={total_rf_used}, "
+                f"已赋值cell的RF槽位上限={total_rf_capacity}, "
+                f"差值(槽位空闲)={total_rf_capacity - total_rf_used}")

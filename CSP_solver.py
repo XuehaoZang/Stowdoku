@@ -2,7 +2,8 @@ import numpy as np
 import copy
 from VesselClass import Vessel
 from utils.viz import print_vessel
-
+# import sys
+# sys.setrecursionlimit(10000)
 
 def cal_candidates(vessel: Vessel) -> dict:
     """
@@ -61,12 +62,18 @@ def _pod_try_order(cands, vessel, bay, lr, hd):
 
     return sorted(cands, key=key)
 
+_solve_call_count = [0]
 
 def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
     """
     统一大递归：装载 + 换港，discharge作为递归中的特殊节点。
     vessel内部维护current_pol和cbf状态。
     """
+    _solve_call_count[0] += 1
+    if _solve_call_count[0] % 500 == 0:
+        print(f"[depth debug] 已调用{_solve_call_count[0]}次, current_pol={vessel.current_pol}, "
+              f"total_remaining={vessel.total_remaining()}")
+    
     if snapshots is None:
         snapshots = {}
 
@@ -82,8 +89,9 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
         discharged = vessel.discharge(vessel.current_pol)
 
         if is_debug:
-            print(f"[Departure] POL={vessel.current_pol - 1}")
-            print(f"[Arrive] POL={vessel.current_pol}, 卸了{len(discharged)}个cell")
+            print(f"[port snapshot] 到达POL={vessel.current_pol}后，cbf现状：")
+            for pod, counts in sorted(vessel.cbf[vessel.current_pol].items()):
+                print(f"    POD={pod}: {counts}")
 
         if solve(vessel, is_debug, snapshots):
             return True

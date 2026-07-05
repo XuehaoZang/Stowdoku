@@ -135,7 +135,10 @@ def find_can_reefer(slots: pd.DataFrame, reefer_csv_path) -> pd.DataFrame:
 # ── CBF解析（.cbf原始货量文件 -> 汇总csv） ───────────────────────────────
  
 _CBF_DATA_LINE_RE = re.compile(r"^46\s+([A-Z]{2}[A-Z]{3})\s+([A-Z0-9]{4})\s+(\d+)")
- 
+# TODO: 简化近似——LYG的箱子目前合并到YKK，未来如需精确建模临时插港，
+_PORT_MERGE_MAP = {
+    "LYG": "YKK",   # 把LYG的货量并到YKK名下
+}
 def parse_cbf_file(cbf_path) -> pd.DataFrame:
     """解析单个.cbf文件(CASP导出的货量汇总)，返回列: POD, length, type, count。"""
     counts = {}
@@ -150,6 +153,7 @@ def parse_cbf_file(cbf_path) -> pd.DataFrame:
                 continue
             pod_raw, iso_raw, count_str = m.groups()
             pod_code = pod_raw[2:]
+            pod_code = _PORT_MERGE_MAP.get(pod_code, pod_code)
             length, _, box_type = parse_iso_code(iso_raw)
             key = (pod_code, length if length is not None else "UNKNOWN", box_type)
             counts[key] = counts.get(key, 0) + int(count_str)

@@ -18,7 +18,7 @@ import os
 
 from utils.vessel_io import (
     build_vessel_geometry, find_can_40ft, find_can_20ft, find_can_reefer,
-    batch_parse_cbf,
+    batch_parse_cbf, STSE_PORT_MAP
 )
 from VesselClass import Vessel
 from CSP_solver import solve
@@ -32,8 +32,7 @@ CBF_JSON = os.path.join(CBF_DIR, "cbf.json")
 BAYPLAN_DIR = "data/STSE/bayplan"
 
 # TODO debug 现在缺少TXG的cbf数据
-# TODO: 反转utils.vessel_io.STSE_PORT_MAP填这里，比如 {0:"SHP",1:"TXG",...}
-PORT_NAMES = None
+PORT_NAMES = {v: k for k, v in STSE_PORT_MAP.items()}
 
 
 def ensure_geometry() -> str:
@@ -70,7 +69,7 @@ def main():
     vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
 
     snapshots = {}
-    success = solve(vessel, is_debug=False, snapshots=snapshots)
+    success = solve(vessel, is_debug=True, snapshots=snapshots)
 
     if not success:
         print(
