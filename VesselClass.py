@@ -11,8 +11,10 @@ class Vessel:
     """
     CSP配载规划的数据层。
     - 静态几何层：从full_slot_table派生一次，之后只读
-    - 动态状态层：self.cell，每个(bay,lr,hd)存一条记录{"POD":.., "type":.., "POL":..}，
-      是cell颗粒度的"配载单"，字段和proj_cell_to_vessel/export_bayplan导出的列名对齐。
+    - 动态状态层：self.cell，每个(bay,lr,hd)存一条记录{"POD":.., "POL":.., "GP_count":.., "RF_count":..}，
+      是cell颗粒度的"配载单"。一个cell只对应一个POD，但内部可以同时装这个POD的
+      GP和RF两部分箱量（RF额度优先用满这个cell真实的reefer插座数capacity_rf，
+      剩余容量再装同一个POD的GP箱），不再是"整个cell要么GP要么RF"的互斥选择。
       搜索过程中读写，支持回溯。
 
     坐标系：
@@ -21,8 +23,8 @@ class Vessel:
         hd   : 0=hold(tier 0-3), 1=deck(tier 4-9)
     """
 
-    _EMPTY_RECORD = {"POD": -1, "type": None, "POL": -1, "count": 0}
-    # 未赋值cell的记录模板。count=实际装的箱量（<=capacity，never超装）。
+    _EMPTY_RECORD = {"POD": -1, "POL": -1, "GP_count": 0, "RF_count": 0}
+    # 未赋值cell的记录模板。GP_count/RF_count=实际装的箱量（<=各自capacity，never超装）。
     # 注意：每个cell必须持有独立的dict实例，
     # 不能用np.full(shape, {...})批量填充——那样所有cell会共享同一个dict对象，
     # 改一个牵动全部。__init__里逐个构造。
@@ -107,7 +109,11 @@ class Vessel:
     # ── 查询方法 ───────────────────────────────────────────────────────
 
     def get_candidates(self, bay, lr, hd) -> set:
-        """返回(POD, type)候选对集合，三层过滤：不能翻箱、可装特殊箱（reefer）、有cbf余量。"""
+        """
+        返回候选POD集合（不再区分type——一个POD候选意味着这个cell可以同时
+        用它的GP和/或RF箱量，具体内部怎么拆在assign()里决定）。
+        三层过滤：不能翻箱、这个POD在这里至少有一种箱量能放（GP或有reefer能力的RF）、有cbf余量。
+        """
         if not self.is_valid[bay, lr, hd]:
             return set()
 
@@ -129,10 +135,10 @@ class Vessel:
         for pod, counts in current_cbf.items():
             if not (pod_lo <= pod <= pod_hi):
                 continue
-            if counts.get("GP", 0) > 0:
-                candidates.add((pod, "GP"))
-            if self.has_reefer[bay, lr, hd] and counts.get("RF", 0) > 0:
-                candidates.add((pod, "RF"))
+            has_gp_demand = counts.get("GP", 0) > 0
+            has_rf_demand = self.has_reefer[bay, lr, hd] and counts.get("RF", 0) > 0
+            if has_gp_demand or has_rf_demand:
+                candidates.add(pod)
 
         return candidates
 
@@ -156,24 +162,37 @@ class Vessel:
 
     # ── 赋值与撤销 ─────────────────────────────────────────────────────
 
-    def assign(self, bay, lr, hd, pod, ctype):
+    def assign(self, bay, lr, hd, pod):
         """
-        赋值cell，记录装货港current_pol。
-        扣减cbf时取min(capacity, 当前剩余量)——容量再大也不能超装，
-        剩余量不够填满整个cell时就按实际剩余量装，cbf扣到0为止，不会变负数。
-        实际装的箱量记在cell的"count"字段里，unassign时精确按这个数值加回，
-        不能重新用capacity推算（因为可能小于capacity）。
+        赋值cell给pod，记录装货港current_pol。
+        内部先用这个cell真实的reefer插座数(capacity_rf)优先满足pod的RF需求
+        （取min(capacity_rf, 剩余RF需求)，不超装、不多分），
+        剩余容量(capacity_total - 实际用掉的RF)接着满足同一个pod的GP需求。
+        一个cell只对应一个pod，但GP/RF两部分都可能同时非零。
+        实际用掉的GP_count/RF_count都记在cell记录里，unassign时精确按这两个数值加回。
         """
-        cap = self.capacity_rf[bay, lr, hd] if ctype == "RF" else self.capacity_total[bay, lr, hd]
-        remaining = self.cbf[self.current_pol][pod][ctype]
-        used = min(cap, remaining)
-        self.cell[bay, lr, hd] = {"POD": pod, "type": ctype, "POL": self.current_pol, "count": used}
-        self.cbf[self.current_pol][pod][ctype] = remaining - used
+        cap_total = self.capacity_total[bay, lr, hd]
+        cap_rf = self.capacity_rf[bay, lr, hd]
 
-    def unassign(self, bay, lr, hd, pod, ctype):
-        """撤销赋值，把cell记录里实际装的count加回cbf（不是capacity），精确恢复。"""
-        used = self.cell[bay, lr, hd]["count"]
-        self.cbf[self.current_pol][pod][ctype] += used
+        rf_remaining = self.cbf[self.current_pol][pod].get("RF", 0)
+        rf_used = min(cap_rf, rf_remaining)
+
+        gp_remaining = self.cbf[self.current_pol][pod].get("GP", 0)
+        gp_capacity = cap_total - rf_used
+        gp_used = min(gp_capacity, gp_remaining)
+
+        self.cell[bay, lr, hd] = {
+            "POD": pod, "POL": self.current_pol,
+            "GP_count": gp_used, "RF_count": rf_used,
+        }
+        self.cbf[self.current_pol][pod]["RF"] = rf_remaining - rf_used
+        self.cbf[self.current_pol][pod]["GP"] = gp_remaining - gp_used
+
+    def unassign(self, bay, lr, hd, pod):
+        """撤销赋值，把cell记录里实际用掉的GP_count/RF_count分别加回cbf，精确恢复。"""
+        record = self.cell[bay, lr, hd]
+        self.cbf[self.current_pol][pod]["RF"] = self.cbf[self.current_pol][pod].get("RF", 0) + record["RF_count"]
+        self.cbf[self.current_pol][pod]["GP"] = self.cbf[self.current_pol][pod].get("GP", 0) + record["GP_count"]
         self.cell[bay, lr, hd] = dict(self._EMPTY_RECORD)
 
     # ── 多港口 ─────────────────────────────────────────────────────────
@@ -218,8 +237,7 @@ class Vessel:
 
     def export_cell_state(self) -> dict:
         """导出已赋值cell的状态，供viz展开到slot层面。
-        返回 {(bay, lr, hd): {"POD":.., "type":.., "POL":.., "count":..}}，只含POD != -1的cell。
-        count是实际装的箱量（<=capacity，不一定填满整个cell）。"""
+        返回 {(bay, lr, hd): {"POD":.., "POL":.., "GP_count":.., "RF_count":..}}，只含POD != -1的cell。"""
         result = {}
         for bay in range(self.n_bay):
             for lr in range(2):
@@ -267,9 +285,16 @@ class Vessel:
         cell级解 -> slot级DataFrame投影（proj_vessel_to_cell的逆方向）。
         cell_state: 不传则用当前self.cell；传则接受snapshot()格式的dict（取其"cell"）。
 
-        返回列：bay_idx, row_idx, tier_idx, lr, hd, can_40ft, can_20ft, POL, POD, type
+        返回列：bay_idx, row_idx, tier_idx, lr, hd, can_40ft, can_20ft, can_reefer,
+               POL, POD, GP_count, RF_count
         POL是该cell实际装货时的current_pol（assign()时精确记录），不是快照所属港口，
         两者在同一份snapshot里可能不同（更早港口装、还未卸的货会保留原始POL）。
+
+        GP_count/RF_count是cell级别的聚合数量，广播到这个cell内所有物理槽位上——
+        我们不知道cell内具体哪几个物理槽位装的是reefer、哪几个是普通箱，只知道
+        这个cell总共装了多少。下游画图时若要判断"这个具体槽位是否显示reefer标记"，
+        应该用can_reefer(这个槽位本身是否有reefer插座) and RF_count>0(这个cell
+        是否用到了reefer)一起判断，而不是假设RF_count个槽位就精确对应真实占用的那几个。
 
         can_40ft只标在每对STSE_BAY_PAIRS的b0一侧（见vessel_io.find_can_40ft），
         一个40ft箱物理上同时占用b0和b1两侧的槽位，所以每个cell的解要同时写回
@@ -283,7 +308,8 @@ class Vessel:
         slots = self.full_slot_table.copy()
         slots["POL"] = -1
         slots["POD"] = -1
-        slots["type"] = None
+        slots["GP_count"] = 0
+        slots["RF_count"] = 0
 
         for big_bay, (b0, b1) in enumerate(STSE_BAY_PAIRS):
             b0_can40 = (slots.bay_idx == b0) & slots.can_40ft
@@ -293,14 +319,16 @@ class Vessel:
                     pod = record["POD"]
                     if pod == -1:
                         continue
-                    ctype = record["type"]
                     pol = record["POL"]
+                    gp_count = record["GP_count"]
+                    rf_count = record["RF_count"]
 
                     # b0侧：can_40ft标记的行，直接按(lr,hd)取这个cell对应的所有物理槽位
                     b0_mask = b0_can40 & (slots.lr == lr) & (slots.hd == hd)
                     slots.loc[b0_mask, "POL"] = pol
                     slots.loc[b0_mask, "POD"] = pod
-                    slots.loc[b0_mask, "type"] = ctype
+                    slots.loc[b0_mask, "GP_count"] = gp_count
+                    slots.loc[b0_mask, "RF_count"] = rf_count
 
                     # b1侧：同一批40ft箱占用的另一半，(row_idx,tier_idx)与b0侧完全一致
                     rt_pairs = set(
@@ -313,10 +341,11 @@ class Vessel:
                     )
                     slots.loc[b1_mask, "POL"] = pol
                     slots.loc[b1_mask, "POD"] = pod
-                    slots.loc[b1_mask, "type"] = ctype
+                    slots.loc[b1_mask, "GP_count"] = gp_count
+                    slots.loc[b1_mask, "RF_count"] = rf_count
 
         return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
-                      "can_40ft", "can_20ft", "POL", "POD", "type"]]
+                      "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count"]]
 
     def export_bayplan(self, snapshots: dict, out_dir: str, port_names: dict = None) -> list:
         """

@@ -8,7 +8,7 @@ def cal_candidates(vessel: Vessel) -> dict:
     """
     计算所有valid且未赋值的cell的候选集。
     跳过cbf已空导致候选为空的cell（不视为dead cell）。
-    返回 {(bay, lr, hd): set of (POD, ctype)}，若某cell候选为空且cbf仍有余量则返回None。
+    返回 {(bay, lr, hd): set of POD}，若某cell候选为空且cbf仍有余量则返回None。
     """
     choices = {}
     has_remaining = vessel.total_remaining() > 0
@@ -31,15 +31,35 @@ def cal_candidates(vessel: Vessel) -> dict:
 
 def mrv_select(choices: dict, vessel: Vessel):
     """
-    MRV选择：优先has_reefer且含RF候选的cell，组内按候选集大小升序。
+    MRV选择：优先has_reefer且候选中有POD真的还需要RF的cell（保证冰箱能放），
+    组内按候选集大小升序。
     返回 (bay, lr, hd)
     """
     def priority(item):
         (bay, lr, hd), cands = item
-        has_rf_cand = vessel.has_reefer[bay, lr, hd] and any(t == "RF" for _, t in cands)
-        return (0 if has_rf_cand else 1, len(cands))
+        current_cbf = vessel.cbf[vessel.current_pol]
+        has_rf_need = vessel.has_reefer[bay, lr, hd] and any(
+            current_cbf[pod].get("RF", 0) > 0 for pod in cands
+        )
+        return (0 if has_rf_need else 1, len(cands))
 
     return min(choices.items(), key=priority)[0]
+
+
+def _pod_try_order(cands, vessel, bay, lr, hd):
+    """
+    候选POD的尝试顺序：如果这个cell有reefer能力，优先尝试还有RF需求的POD
+    （避免reefer cell被先分给一个只有GP需求的POD，白白浪费这个cell的reefer额度），
+    其余按POD数值升序。
+    """
+    current_cbf = vessel.cbf[vessel.current_pol]
+    has_reefer_here = vessel.has_reefer[bay, lr, hd]
+
+    def key(pod):
+        rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) > 0
+        return (0 if rf_need else 1, pod)
+
+    return sorted(cands, key=key)
 
 
 def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
@@ -91,16 +111,17 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None) -> bool:
     pos = mrv_select(choices, vessel)
     bay, lr, hd = pos
 
-    for pod, ctype in sorted(choices[pos]):
-        vessel.assign(bay, lr, hd, pod, ctype)
+    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd):
+        vessel.assign(bay, lr, hd, pod)
 
         if is_debug:
-            print(f"  assign ({bay},{lr},{hd}) POD={pod} {ctype}")
+            record = vessel.cell[bay, lr, hd]
+            print(f"  assign ({bay},{lr},{hd}) POD={pod} GP={record['GP_count']} RF={record['RF_count']}")
 
         if solve(vessel, is_debug, snapshots):
             return True
 
-        vessel.unassign(bay, lr, hd, pod, ctype)
+        vessel.unassign(bay, lr, hd, pod)
 
     return False
 
