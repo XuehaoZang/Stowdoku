@@ -50,8 +50,6 @@ def _max_adjacent_pair_sum(bay_totals: np.ndarray) -> int:
 def _ci_from_bay_totals(bay_totals: np.ndarray):
     """CI = 总作业量 / 相邻两个大bay作业量之和的最大值。
     完全均匀分布时，任意相邻两bay应占总量 2/n_bay，这就是CI的理论上限
-    （n_bay=7时约等于3.5，跟实际运营给的目标值吻合，不是巧合，是同一件事）。
-    本港完全没有吊车动作(total=0)时返回None，不参与打分。
     """
     total = bay_totals.sum()
     if total == 0:

@@ -52,6 +52,10 @@ class Vessel:
         self.capacity_rf = capacity_rf.astype(int)
         # capacity_rf[bay][lr][hd]: 该cell内有RF插座的槽位数
         # 用于RF类型赋值时的cbf扣减量
+        
+        self.capacity_hc = self._derive_capacity_hc(self.capacity_total)
+        # capacity_hc[bay][lr][hd]: 该cell内高箱(HC/HR)槽位上限
+        # hold(hd=0): min(N,2)；deck(hd=1): N-1。
 
         self.has_reefer = self.capacity_rf > 0
         # has_reefer[bay][lr][hd]: bool，由capacity_rf推导，方便候选集过滤
@@ -122,6 +126,13 @@ class Vessel:
 
         return cls(full_slot_table=slots, cbf=cbf, current_pol=current_pol)
 
+    @staticmethod
+    def _derive_capacity_hc(capacity_total: np.ndarray) -> np.ndarray:
+            capacity_hc = np.zeros_like(capacity_total)
+            capacity_hc[:, :, 0] = np.minimum(capacity_total[:, :, 0], 2)
+            capacity_hc[:, :, 1] = np.maximum(capacity_total[:, :, 1] - 1, 0)
+            return capacity_hc.astype(int)
+        
     # ── 查询方法 ───────────────────────────────────────────────────────
 
     def get_candidates(self, bay, lr, hd) -> set:
@@ -164,19 +175,17 @@ class Vessel:
                 new_rank = rel_rank(pod)
                 if new_rank > other_rank:
                     continue
-
-            has_gp_demand = counts.get("GP", 0) > self.tail_threshold
-            has_rf_demand = self.has_reefer[bay, lr, hd] and counts.get("RF", 0) > 0
+            has_gp_demand = (counts.get("GP", 0) + counts.get("HC", 0)) > self.tail_threshold
+            has_rf_demand = self.has_reefer[bay, lr, hd] and (counts.get("RF", 0) + counts.get("HR", 0)) > 0
             if has_gp_demand or has_rf_demand:
                 candidates.add(pod)
 
         return candidates
-
+    
     def remaining_pods(self) -> set:
-        """当前POL中cbf总量>尾货阈值的POD集合（阈值以下的尾货不阻塞港口收尾）。"""
         return {
             pod for pod, counts in self.cbf[self.current_pol].items()
-            if counts.get("GP", 0) + counts.get("RF", 0) > self.tail_threshold
+            if sum(counts.get(k, 0) for k in ("GP", "HC", "RF", "HR")) > self.tail_threshold
         }
 
     def port_complete(self) -> bool:
@@ -186,49 +195,49 @@ class Vessel:
     def total_remaining(self) -> int:
         """当前POL的cbf剩余总箱量。"""
         return sum(
-            c.get("GP", 0) + c.get("RF", 0)
+            sum(c.get(k, 0) for k in ("GP", "HC", "RF", "HR"))
             for c in self.cbf[self.current_pol].values()
         )
 
-    # ── 赋值与撤销 ─────────────────────────────────────────────────────
 
+    # ── 赋值与撤销 ─────────────────────────────────────────────────────
     def assign(self, bay, lr, hd, pod):
-        """
-        赋值cell给pod，记录装货港current_pol。
-        内部先用这个cell真实的reefer插座数(capacity_rf)优先满足pod的RF需求
-        （取min(capacity_rf, 剩余RF需求)，不超装、不多分），
-        剩余容量(capacity_total - 实际用掉的RF)接着满足同一个pod的GP需求。
-        一个cell只对应一个pod，但GP/RF两部分都可能同时非零。
-        实际用掉的GP_count/RF_count都记在cell记录里，unassign时精确按这两个数值加回。
-        """
         cap_total = self.capacity_total[bay, lr, hd]
         cap_rf = self.capacity_rf[bay, lr, hd]
 
-        rf_remaining = self.cbf[self.current_pol][pod].get("RF", 0)
-        rf_used = min(cap_rf, rf_remaining)
+        demand = self.cbf[self.current_pol][pod]
+        rf_demand, hr_demand = demand.get("RF", 0), demand.get("HR", 0)
+        gp_demand, hc_demand = demand.get("GP", 0), demand.get("HC", 0)
 
-        gp_remaining = self.cbf[self.current_pol][pod].get("GP", 0)
+        rf_total_remaining = rf_demand + hr_demand
+        rf_used = min(cap_rf, rf_total_remaining)
+        rf_deduct_rf = min(rf_demand, rf_used)
+        rf_deduct_hr = rf_used - rf_deduct_rf
+
+        gp_total_remaining = gp_demand + hc_demand
         gp_capacity = cap_total - rf_used
-        gp_used = min(gp_capacity, gp_remaining)
+        gp_used = min(gp_capacity, gp_total_remaining)
+        gp_deduct_gp = min(gp_demand, gp_used)
+        gp_deduct_hc = gp_used - gp_deduct_gp
 
         self.cell[bay, lr, hd] = {
             "POD": pod, "POL": self.current_pol,
             "GP_count": gp_used, "RF_count": rf_used,
+            "_gp_from_gp": gp_deduct_gp, "_gp_from_hc": gp_deduct_hc,
+            "_rf_from_rf": rf_deduct_rf, "_rf_from_hr": rf_deduct_hr,
         }
-        self.cbf[self.current_pol][pod]["RF"] = rf_remaining - rf_used
-        self.cbf[self.current_pol][pod]["GP"] = gp_remaining - gp_used
-        self.current_port_bay_load[bay] += gp_used + rf_used
+        demand["GP"] = gp_demand - gp_deduct_gp
+        demand["HC"] = hc_demand - gp_deduct_hc
+        demand["RF"] = rf_demand - rf_deduct_rf
+        demand["HR"] = hr_demand - rf_deduct_hr
 
-        # print(f"[assign] POL={self.current_pol} POD={pod} cell=({bay},{lr},{hd}) "
-        #       f"装GP={gp_used} 装RF={rf_used}  →  剩余cbf[POD={pod}]="
-        #       f"{self.cbf[self.current_pol][pod]}")
-        
     def unassign(self, bay, lr, hd, pod):
-        """撤销赋值，把cell记录里实际用掉的GP_count/RF_count分别加回cbf，精确恢复。"""
         record = self.cell[bay, lr, hd]
-        self.cbf[self.current_pol][pod]["RF"] = self.cbf[self.current_pol][pod].get("RF", 0) + record["RF_count"]
-        self.cbf[self.current_pol][pod]["GP"] = self.cbf[self.current_pol][pod].get("GP", 0) + record["GP_count"]
-        self.current_port_bay_load[bay] -= record["GP_count"] + record["RF_count"]
+        demand = self.cbf[self.current_pol][pod]
+        demand["GP"] = demand.get("GP", 0) + record["_gp_from_gp"]
+        demand["HC"] = demand.get("HC", 0) + record["_gp_from_hc"]
+        demand["RF"] = demand.get("RF", 0) + record["_rf_from_rf"]
+        demand["HR"] = demand.get("HR", 0) + record["_rf_from_hr"]
         self.cell[bay, lr, hd] = dict(self._EMPTY_RECORD)
 
     # ── 多港口 ─────────────────────────────────────────────────────────

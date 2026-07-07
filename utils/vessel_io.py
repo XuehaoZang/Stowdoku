@@ -184,18 +184,22 @@ def _bucket_type(box_type):
     return "RF" if box_type in ("RF", "HR") else "GP"
 
 def cbf_df_to_dict(df: pd.DataFrame) -> dict:
-    """把parse_cbf_file的输出(POD,length,type,count)转成{POD:{"GP":n,"RF":n}}。
-    20ft和40ft按 20ft//2 + 40ft 合并成40ft槽位数(2个20ft算1个大箱)；
-    length='UNKNOWN'(ISO无法识别)的行没法换算，跳过并警告。"""
+    """(POD,length,type,count) -> {POD: {"GP":n,"HC":n,"RF":n,"HR":n}}。
+    四种箱型原样保留，不再归并（HC/HR不并进GP/RF）。
+    20ft按//2合并进40ft槽位数，一律记入GP（HC/RF/HR不做20ft换算假设）；
+    length='UNKNOWN'的行跳过并警告。"""
     result = {}
     for pod, group in df.groupby("POD"):
-        totals = {"GP": 0, "RF": 0}
+        totals = {"GP": 0, "HC": 0, "RF": 0, "HR": 0}
         for _, row in group.iterrows():
             if row.length == "UNKNOWN":
                 print(f"警告: POD={pod} type={row.type} length无法识别，count={row['count']}已跳过")
                 continue
-            slots = row["count"] // 2 if row.length == 20 else row["count"]
-            totals[_bucket_type(row.type)] += int(slots)
+            if row.length == 20:
+                totals["GP"] += int(row["count"]) // 2
+                continue
+            box_type = row.type if row.type in ("GP", "HC", "RF", "HR") else "GP"
+            totals[box_type] += int(row["count"])
         result[int(pod)] = totals
     return result
 

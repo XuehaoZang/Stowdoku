@@ -36,7 +36,6 @@ CBF_DIR = "data/STSE/cbf"
 CBF_JSON = os.path.join(CBF_DIR, "cbf.json")
 BAYPLAN_DIR = "data/STSE/bayplan"
 
-# TODO debug 现在缺少TXG的cbf数据
 PORT_NAMES = {v: k for k, v in STSE_PORT_MAP.items()}
 
 
@@ -66,6 +65,54 @@ def ensure_cbf() -> str:
     print(f"[cbf] 已构建 {CBF_JSON}")
     return CBF_JSON
 
+def tag_hicube_allocation(self, snapshots: dict, original_cbf: dict, hc_order="cap_desc"):
+    """
+    全部港口解完后的高箱贴标签。不修改GP_count/RF_count（分配数量本身不受影响），
+    只在已装槽位里追加GP_HC_count/RF_HC_count两个字段，标明这些槽位里哪些算高箱。
+    RF_HC只能从这个cell的RF_count槽位里贴（reefer插座限制仍在），
+    GP_HC只能从GP_count槽位里贴，两者共享同一个cell的capacity_hc上限。
+    original_cbf: solve()跑之前的cbf深拷贝（如__main__里的vessel_init.cbf），
+    用来读每个(POL,POD)原始的HC/HR需求量——snapshots里的cbf已经是assign()扣减后的余量，
+    不能拿来当"原始需求"用。
+    hc_order: 同一个POD跨多个cell时的喂入顺序，"cap_desc"=按这个cell的capacity_hc余量降序
+    （默认；平均分配等策略以后可扩展这个参数，这里暂不实现）。
+    打印每个(POL,POD)的原始HC/HR需求 vs 实际贴上标签数 vs 缺口（缺口如实报告，
+    贴不上的槽位保持原样降级为普通标签，不吞掉）。
+    """
+    for pol, snap in sorted(snapshots.items()):
+        cell = snap["cell"]
+        pod_cells = {}
+        for bay in range(self.n_bay):
+            for lr in range(2):
+                for hd in range(2):
+                    record = cell[bay, lr, hd]
+                    if record["POD"] != -1:
+                        pod_cells.setdefault(record["POD"], []).append((bay, lr, hd, record))
+
+        for pod, cells in sorted(pod_cells.items()):
+            demand = original_cbf.get(pol, {}).get(pod, {})
+            hc_remaining = demand.get("HC", 0)
+            rf_hc_remaining = demand.get("HR", 0)
+            hc_need, rf_hc_need = hc_remaining, rf_hc_remaining
+
+            if hc_order == "cap_desc":
+                cells = sorted(cells, key=lambda c: self.capacity_hc[c[0], c[1], c[2]], reverse=True)
+
+            for bay, lr, hd, record in cells:
+                cap_hc = self.capacity_hc[bay, lr, hd]
+
+                rf_hc_used = min(rf_hc_remaining, record["RF_count"], cap_hc)
+                gp_hc_used = min(hc_remaining, record["GP_count"], cap_hc - rf_hc_used)
+
+                record["RF_HC_count"] = rf_hc_used
+                record["GP_HC_count"] = gp_hc_used
+
+                rf_hc_remaining -= rf_hc_used
+                hc_remaining -= gp_hc_used
+
+            print(f"POL={pol} POD={pod}: HC需求={hc_need}, 已贴标={hc_need - hc_remaining}, "
+                  f"缺口={hc_remaining}  |  HR(冷藏高箱)需求={rf_hc_need}, "
+                  f"已贴标={rf_hc_need - rf_hc_remaining}, 缺口={rf_hc_remaining}")
 
 def main():
     import copy
@@ -111,11 +158,13 @@ def main():
                     port_label = PORT_NAMES.get(pod, pod)
                     print(f"    POL={pol} POD={port_label}: {counts}")
 
-    if snapshots:
-        evaluate_crane_intensity(vessel, snapshots, target_ci=TARGET_CI, port_names=PORT_NAMES)
-    else:
-        print("\n[evaluate] 没有完整的逐港snapshots（求解失败且未走到任何一港完成），跳过CI评估")
+    # if snapshots:
+    #     evaluate_crane_intensity(vessel, snapshots, target_ci=TARGET_CI, port_names=PORT_NAMES)
+    # else:
+    #     print("\n[evaluate] 没有完整的逐港snapshots（求解失败且未走到任何一港完成），跳过CI评估")
     # evaluate_pod_leverage(original_cbf)
+    
+    tag_hicube_allocation(vessel, snapshots, original_cbf)
 
     paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, port_names=PORT_NAMES, if_plot_phy=False)
     print(f"Exported {len(paths)} bayplan files to {BAYPLAN_DIR}")
