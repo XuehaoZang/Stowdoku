@@ -8,11 +8,12 @@ from utils.viz import print_vessel
 def cal_candidates(vessel: Vessel) -> dict:
     """
     计算所有valid且未赋值的cell的候选集。
-    跳过cbf已空导致候选为空的cell（不视为dead cell）。
-    返回 {(bay, lr, hd): set of POD}，若某cell候选为空且cbf仍有余量则返回None。
+    某个具体cell候选为空（比如被舱盖约束锁死、或只是这个cell放不下剩余需求）
+    只代表这个cell这次不用、留空，不代表整体失败。
+    只有扫完所有cell后，choices整体为空、且仍有超过尾货阈值的需求没处理完，
+    才是真正的死路（没有任何地方能再装下去了）。
     """
     choices = {}
-    has_remaining = vessel.total_remaining() > 0
     for bay in range(vessel.n_bay):
         for lr in range(2):
             for hd in range(2):
@@ -21,20 +22,22 @@ def cal_candidates(vessel: Vessel) -> dict:
                 if vessel.cell[bay, lr, hd]["POD"] != -1:
                     continue
                 cands = vessel.get_candidates(bay, lr, hd)
-                if not cands:
-                    if has_remaining:
-                        return None  # 真正的dead cell：cbf有货但此处放不下
-                    # cbf已空，跳过此cell
-                    continue
-                choices[(bay, lr, hd)] = cands
+                if cands:
+                    choices[(bay, lr, hd)] = cands
+
+    if not choices and len(vessel.remaining_pods()) > 0:
+        return None  # 真正的dead cell：没有任何cell能接下剩余需求
     return choices
 
 
 def mrv_select(choices: dict, vessel: Vessel):
     """
     MRV选择：优先has_reefer且候选中有POD真的还需要RF的cell（保证冰箱能放），
-    组内按候选集大小升序。
+    其次优先hold(hd=0)而非deck(hd=1)——hold一旦被deck盖住就永久锁死，
+    先填hold能避免不必要地触发舱盖约束、减少回溯，
+    组内最后按候选集大小升序。
     返回 (bay, lr, hd)
+    # TODO 从candidate最少的开始选？能不能引入CI来引导？
     """
     def priority(item):
         (bay, lr, hd), cands = item
@@ -42,7 +45,7 @@ def mrv_select(choices: dict, vessel: Vessel):
         has_rf_need = vessel.has_reefer[bay, lr, hd] and any(
             current_cbf[pod].get("RF", 0) > 0 for pod in cands
         )
-        return (0 if has_rf_need else 1, len(cands))
+        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, len(cands))
 
     return min(choices.items(), key=priority)[0]
 

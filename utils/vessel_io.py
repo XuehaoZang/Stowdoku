@@ -38,6 +38,15 @@ STSE_HATCH_SPLIT = 5   # row_idx < 5 -> left, >=5 -> right
 STSE_DECK_TIER = 4     # tier_idx < 4 -> hold, >=4 -> deck
 
 STSE_PORT_MAP = {"SHP": 0, "TXG": 1, "DLC": 2, "YKK": 3, "NGO": 4, "TYO": 5, "YOK": 6, "LYG": 7}
+
+STSE_PORT_COLORS = {
+    "SHA": "#FF8080", "NGO": "#408080", "WEI": "#8000FF", "YOK": "#80FFFF",
+    "TYO": "#FF0000", "TXG": "#FF8040", "YNT": "#800040", "DLC": "#0080FF",
+    "UKB": "#FF0080", "LKU": "#008000", "HKT": "#408080", "KWS": "#00FF41",
+    "SHP": "#FFFF80", "TAO": "#800080", "OSA": "#808000", "THS": "#00FF80",
+    "LYG": "#FF80FF", "YKK": "#008000", "PUS": "#0080FF", "PTK": "#00FFFF",
+    "SMZ": "#FFFF00", "DAE": "#8080C0", "TAY": "#0000FF", "KWA": "#FF00FF",
+}
  
 _ISO_TYPE_HEIGHT = {"GP": 8.5, "HC": 9.5, "RF": 9.5, "HR": 9.5, "FR": 8.5, "FP": 8.5, "OT": 8.5, "TK": 8.5, "TG": 8.5}
  
@@ -57,6 +66,12 @@ def phy_to_idx(bay_p, row_p, tier_p):
     r_idx = STSE_ROW_LABELS.index(str(int(row_p)).zfill(2))
     t_idx = STSE_TIER_LABELS.index(str(int(tier_p)).zfill(2))
     return b_idx, r_idx, t_idx
+
+
+def idx_to_phy_bay(bay_idx: int) -> str:
+    """0-base bay_idx -> 真实物理Bay码(两位数字符串，如'01','03'...)。phy_to_idx的逆映射(仅bay这一维)。"""
+    bay_p = 1 if bay_idx == 0 else 2 * bay_idx - 1
+    return str(bay_p).zfill(2)
 
 
 def build_vessel_geometry(slots_csv_path) -> pd.DataFrame:

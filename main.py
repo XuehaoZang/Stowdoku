@@ -70,14 +70,7 @@ def main():
     cbf_json_path = ensure_cbf()
 
     vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
-
-    # 求解前，先记一份原始总需求量作为对照基准
-    initial_total = sum(
-        counts.get("GP", 0) + counts.get("RF", 0)
-        for pod_dict in vessel.cbf.values()
-        for counts in pod_dict.values()
-    )
-
+    
     snapshots = {}
     best = {"assigned": -1, "vessel": None}
     success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
@@ -102,32 +95,16 @@ def main():
         for pod_dict in result_vessel.cbf.values()
         for counts in pod_dict.values()
     )
-    print(f"原始总需求: {initial_total}箱")
-    print(f"已成功装载(cbf已扣减): {initial_total - remaining_total}箱")
-    print(f"仍留在剩余cbf里未装上的: {remaining_total}箱")
-    print(f"此刻船上还压着未卸货的(目的港尚未到达，如绕圈货): "
-          f"{_total_assigned(result_vessel)}箱")
-
-    print("\n──── 逐港路线(每港离港时的装载快照) ────")
-    for pol in sorted(snapshots.keys()):
-        snap = snapshots[pol]  # {"cell": ndarray, "cbf": dict, "current_pol": int}
-        port_label = PORT_NAMES.get(pol, pol)
-        onboard = sum(
-            record["GP_count"] + record["RF_count"]
-            for record in snap["cell"].flatten()
-            if record["POD"] != -1
-        )
-        print(f"  离开POL={pol}({port_label}) 时，船上共有{onboard}箱")
 
     if remaining_total > 0:
-        print("\n剩余cbf明细（未能装上的部分）：")
+        print("\n尾货cbf明细：")
         for pol, pod_dict in sorted(result_vessel.cbf.items()):
             for pod, counts in sorted(pod_dict.items()):
                 if counts.get("GP", 0) > 0 or counts.get("RF", 0) > 0:
                     port_label = PORT_NAMES.get(pod, pod)
                     print(f"    POL={pol} POD={port_label}: {counts}")
 
-    paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, port_names=PORT_NAMES)
+    paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, port_names=PORT_NAMES, if_plot_phy=True)
     print(f"Exported {len(paths)} bayplan files to {BAYPLAN_DIR}")
     
 

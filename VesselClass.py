@@ -29,7 +29,7 @@ class Vessel:
     # 不能用np.full(shape, {...})批量填充——那样所有cell会共享同一个dict对象，
     # 改一个牵动全部。__init__里逐个构造。
 
-    def __init__(self, full_slot_table: pd.DataFrame, cbf: dict, current_pol: int = 0):
+    def __init__(self, full_slot_table: pd.DataFrame, cbf: dict, current_pol: int = 0, tail_threshold: int = 5):
         if full_slot_table is None:
             raise ValueError("full_slot_table 不能为空")
         if cbf is None:
@@ -85,6 +85,10 @@ class Vessel:
         self.current_pol = current_pol
         # 当前装载港口编号，指向cbf的第一层key
         # 换港时只更新这个指针，cbf本身不变
+        
+        self.tail_threshold = tail_threshold
+        # 单个POD剩余需求 <= 此阈值时，视为"尾货"，不再主动占用cell，
+        # 留到求解结束后统一打印，交给后续人工/专门策略处理
 
     # ── 构造 ───────────────────────────────────────────────────────────
 
@@ -119,12 +123,25 @@ class Vessel:
         """
         返回候选POD集合（不再区分type——一个POD候选意味着这个cell可以同时
         用它的GP和/或RF箱量，具体内部怎么拆在assign()里决定）。
-        三层过滤：不能翻箱、这个POD在这里至少有一种箱量能放（GP或有reefer能力的RF）、有cbf余量。
+        四层过滤：舱盖物理限制（hold在deck下方，deck一旦有货hold就无法再装，
+        deck方向没有对称限制）、不能翻箱（按相对current_pol的挂靠距离比较，
+        允许环线绕圈）、这个POD在这里至少有一种箱量能放（GP需求超过尾货阈值，
+        或有reefer能力的RF）、有cbf余量。
         """
         if not self.is_valid[bay, lr, hd]:
             return set()
 
         current_cbf = self.cbf[self.current_pol]  # {POD: {"GP": n, "RF": n}}
+
+        other_hd = 1 - hd
+        other_pod = self.cell[bay, lr, other_hd]["POD"]
+
+        # 舱盖硬约束：hold(hd=0)物理上被deck(hd=1)的舱盖盖住，deck一旦有货
+        # （不管是本港刚装的还是更早港口还没卸的），hold就无法再装任何新货，
+        # 除非deck先清空——这不是no-overstow的排序问题，是舱盖结构本身的
+        # 物理限制，deck方向没有对称限制（hold空或不空，都不妨碍往deck装货）。
+        if hd == 0 and other_pod != -1:
+            return set()
 
         def rel_rank(pod):
             """相对current_pol的挂靠距离，允许绕圈（用port_min把港口范围平移到0起点）。"""
@@ -132,24 +149,18 @@ class Vessel:
             p = (pod - self.port_min) % self.n_ports
             return (p - c) if p >= c else (p - c + self.n_ports)
 
-        # 第一层：no-overstow，同一(bay, lr)的hold/deck POD约束，用相对距离比较
-        other_hd = 1 - hd
-        other_pod = self.cell[bay, lr, other_hd]["POD"]
+        # 走到这里，要么other_pod==-1，要么hd==1且hold已有货——
+        # 此时deck候选必须比hold的货早卸（距离更小）
         other_rank = rel_rank(other_pod) if other_pod != -1 else None
 
-        # 第二层：capabilities + 第三层：cbf余量，同时过滤
         candidates = set()
         for pod, counts in current_cbf.items():
             if other_rank is not None:
                 new_rank = rel_rank(pod)
-                if hd == 0:        # 当前是hold，必须比deck的货晚卸（距离≥）
-                    if new_rank < other_rank:
-                        continue
-                else:              # 当前是deck，必须比hold的货早卸（距离≤）
-                    if new_rank > other_rank:
-                        continue
+                if new_rank > other_rank:
+                    continue
 
-            has_gp_demand = counts.get("GP", 0) > 0
+            has_gp_demand = counts.get("GP", 0) > self.tail_threshold
             has_rf_demand = self.has_reefer[bay, lr, hd] and counts.get("RF", 0) > 0
             if has_gp_demand or has_rf_demand:
                 candidates.add(pod)
@@ -157,10 +168,10 @@ class Vessel:
         return candidates
 
     def remaining_pods(self) -> set:
-        """当前POL中cbf总量>0的POD集合。"""
+        """当前POL中cbf总量>尾货阈值的POD集合（阈值以下的尾货不阻塞港口收尾）。"""
         return {
             pod for pod, counts in self.cbf[self.current_pol].items()
-            if counts.get("GP", 0) + counts.get("RF", 0) > 0
+            if counts.get("GP", 0) + counts.get("RF", 0) > self.tail_threshold
         }
 
     def port_complete(self) -> bool:
@@ -398,7 +409,7 @@ class Vessel:
         return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
                       "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count"]]
 
-    def export_bayplan(self, snapshots: dict, out_dir: str, port_names: dict = None) -> list:
+    def export_bayplan(self, snapshots: dict, out_dir: str, port_names: dict = None, if_plot_phy: bool = False) -> list:
         """
         遍历snapshots（solve()产出的{POL: snapshot_dict}），对每个POL调用proj_cell_to_vessel，
         存成{POL}_{港口码}_DEP_bayplan.csv，同时调用utils.viz.plot_bayplan画一张png，
@@ -423,13 +434,21 @@ class Vessel:
         os.makedirs(out_dir, exist_ok=True)
         paths = []
 
-        # 所有港口共用一套POD颜色映射，方便跨港口对比同一POD在不同图里颜色一致
+        from utils.vessel_io import STSE_PORT_COLORS
+
+        # 所有港口共用一套POD颜色映射，方便跨港口对比同一POD在不同图里颜色一致。
+        # 优先用手动指定的STSE_PORT_COLORS(按港口三字码查)，查不到的POD用自动色板。
         all_pods = set()
         for snap in snapshots.values():
             for record in snap["cell"].flatten():
                 if record["POD"] != -1:
                     all_pods.add(record["POD"])
-        port_colors = _default_port_colors(all_pods)
+
+        fallback_colors = _default_port_colors(all_pods)
+        port_colors = {}
+        for pod in all_pods:
+            code = port_names.get(pod) if port_names else None
+            port_colors[pod] = STSE_PORT_COLORS.get(code, fallback_colors[pod])
 
         for pol in sorted(snapshots.keys()):
             code = port_names.get(pol, str(pol)) if port_names else str(pol)
@@ -439,12 +458,13 @@ class Vessel:
             df.to_csv(csv_path, index=False)
             paths.append(csv_path)
 
-            png_path = plot_bayplan(
+            png_paths = plot_bayplan(
                 df, title=f"POL={pol} ({code}) departure",
                 filename=f"{pol}_{code}_DEP_bayplan.png",
-                save_dir=out_dir, port_colors=port_colors,
+                save_dir=out_dir, port_colors=port_colors, port_names=port_names,
+                if_plot_phy=if_plot_phy,
             )
-            paths.append(png_path)
+            paths.extend(png_paths)
 
         return paths
     
