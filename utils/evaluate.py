@@ -24,19 +24,6 @@ from VesselClass import Vessel
 
 # ── 内部小工具，不对外暴露 ───────────────────────────────────────────
 
-def _make_zones(n_bay: int, crane_number: int = 3):
-    """把n_bay个big_bay连续切成crane_number组，尽量均匀（前面的组多分一个）。
-    n_bay=7, crane_number=3 -> [(0,1,2), (3,4), (5,6)]
-    """
-    base, rem = divmod(n_bay, crane_number)
-    zones, start = [], 0
-    for i in range(crane_number):
-        size = base + (1 if i < rem else 0)
-        zones.append(tuple(range(start, start + size)))
-        start += size
-    return zones
-
-
 def _bay_totals_from_cell(cell: np.ndarray, n_bay: int, filter_fn) -> np.ndarray:
     """按bay汇总cell里满足filter_fn(record)的GP_count+RF_count。"""
     totals = np.zeros(n_bay, dtype=int)
@@ -49,14 +36,30 @@ def _bay_totals_from_cell(cell: np.ndarray, n_bay: int, filter_fn) -> np.ndarray
     return totals
 
 
-def _ci_from_zone_loads(zone_loads: np.ndarray, crane_number: int):
-    """CI = 总作业量 / 最大吊车作业量，越接近crane_number越均衡。
-    本港完全没有吊车动作(total=0)时返回None，不参与打分——不是不均衡，是没有可比性。
+def _max_adjacent_pair_sum(bay_totals: np.ndarray) -> int:
+    """相邻两个大bay作业量之和的最大值——两台真实吊车不能挨得太近同时作业，
+    所以真正的瓶颈是"最挤的那一对相邻bay"，不是任何人为划出来的zone。
+    bay index的相邻关系默认对应船体前后方向上的物理相邻（标准做法），
+    n_bay<2时没有"相邻对"这个概念，返回总量本身，交给上层按total==0的逻辑处理。
     """
-    total = zone_loads.sum()
+    if len(bay_totals) < 2:
+        return int(bay_totals.sum())
+    return int(max(bay_totals[i] + bay_totals[i + 1] for i in range(len(bay_totals) - 1)))
+
+
+def _ci_from_bay_totals(bay_totals: np.ndarray):
+    """CI = 总作业量 / 相邻两个大bay作业量之和的最大值。
+    完全均匀分布时，任意相邻两bay应占总量 2/n_bay，这就是CI的理论上限
+    （n_bay=7时约等于3.5，跟实际运营给的目标值吻合，不是巧合，是同一件事）。
+    本港完全没有吊车动作(total=0)时返回None，不参与打分。
+    """
+    total = bay_totals.sum()
     if total == 0:
         return None
-    return total / zone_loads.max()
+    max_pair = _max_adjacent_pair_sum(bay_totals)
+    if max_pair == 0:
+        return None
+    return total / max_pair
 
 
 def _port_sequence(port: int, port_min: int, n_ports: int) -> int:
@@ -66,8 +69,8 @@ def _port_sequence(port: int, port_min: int, n_ports: int) -> int:
 
 # ── 对外评估函数 ─────────────────────────────────────────────────────
 
-def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, crane_number: int = 3,
-                              zones=None, port_names: dict = None) -> list:
+def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, target_ci: float = 2,
+                              port_names: dict = None) -> list:
     """
     对solve()跑出来的snapshots逐港口计算实际CI值，打印一张表并返回明细。
 
@@ -75,11 +78,13 @@ def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, crane_number: int 
                       = 紧邻X之前的那个departure快照里POD==X的记录
                       （航次起点没有"到达"这个动作，记为全0，是合理的边界情况）
     loading_tally:    port X自己departure快照里POL==X的记录(按bay)
-    两者相加、按zones分组求和，代入CI公式。
-    """
-    if zones is None:
-        zones = _make_zones(vessel.n_bay, crane_number)
+    两者相加得到这一港每个bay的作业量，CI = 总量 / 最挤的相邻bay对之和。
 
+    target_ci是参考基准，不是硬约束——按目前拿到的运营经验，
+    总作业量500以内目标CI在3.5左右（对应n_bay=7下完全均匀分布的理论值），
+    不同总量级别下这个目标可能要相应调整，这里先留一个可传参的默认值，
+    不同吨位/箱量的港口不一定该用同一个数字比较。
+    """
     pols_in_order = sorted(snapshots.keys())
     prev_snap = None
     results = []
@@ -102,22 +107,25 @@ def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, crane_number: int 
         )
 
         bay_total = discharge_tally + loading_tally
-        zone_loads = np.array([bay_total[list(z)].sum() for z in zones])
-        ci = _ci_from_zone_loads(zone_loads, crane_number)
+        ci = _ci_from_bay_totals(bay_total)
 
         label = port_names.get(pol, pol) if port_names else pol
         results.append({
             "pol": pol, "label": label,
             "discharge_tally": discharge_tally, "loading_tally": loading_tally,
-            "zone_loads": zone_loads, "ci": ci,
+            "bay_total": bay_total, "ci": ci,
         })
         prev_snap = snap
 
-    print(f"\n──── CI评估（crane_number={crane_number}, zones={zones}）────")
+    print(f"\n──── CI评估（相邻bay对滑窗定义, target_ci={target_ci}）────")
     for r in results:
-        zone_str = " / ".join(str(int(x)) for x in r["zone_loads"])
-        ci_str = f"{r['ci']:.3f}" if r["ci"] is not None else "N/A(本港无吊车动作)"
-        print(f"  POL={r['pol']}({r['label']}): zone作业量=[{zone_str}]  CI={ci_str}")
+        bay_str = " ".join(str(int(x)) for x in r["bay_total"])
+        if r["ci"] is None:
+            ci_str = "N/A(本港无吊车动作)"
+        else:
+            flag = "  ⚠️ 低于目标" if r["ci"] < target_ci else ""
+            ci_str = f"{r['ci']:.3f}{flag}"
+        print(f"  POL={r['pol']}({r['label']}): 各bay作业量=[{bay_str}]  CI={ci_str}")
 
     return results
 

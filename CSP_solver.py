@@ -31,22 +31,34 @@ def cal_candidates(vessel: Vessel) -> dict:
     return choices
 
 
+def _ci_marginal_cost(vessel: Vessel, bay: int, lr: int, hd: int) -> int:
+    """
+    TODO 需要继续思考有没有更好的算法来建模CI问题。
+    假设往这个cell装满(用capacity_total估算，不用实际会装多少)，
+    相邻bay对里最挤的那一对会变成多大——用来在mrv_select里挑"往哪个bay放
+    对本港CI伤害最小"的格子。
+
+    刻意不用assign()真实会用掉的量(gp_used+rf_used)去估算：如果用真实量，
+    这个打分会被_pod_try_order选哪个POD牵着走——选一个剩余需求很少的POD，
+    这一步实际装得少，打分会显得"贡献小、很均衡"，但那只是这个cell被浪费了
+    大半容量，不是真的均衡。用capacity_total不依赖POD是谁，天然避开这个博弈。
+    """
+    hypothetical = vessel.current_port_bay_load.copy()
+    hypothetical[bay] += vessel.capacity_total[bay, lr, hd]
+    if len(hypothetical) < 2:
+        return int(hypothetical.sum())
+    return int(max(hypothetical[i] + hypothetical[i + 1] for i in range(len(hypothetical) - 1)))
+
+
 def mrv_select(choices: dict, vessel: Vessel):
     """
     MRV选择：优先has_reefer且候选中有POD真的还需要RF的cell（保证冰箱能放），
     其次优先hold(hd=0)而非deck(hd=1)——hold一旦被deck盖住就永久锁死，
     先填hold能避免不必要地触发舱盖约束、减少回溯，
-    组内最后按候选集大小升序，候选集大小也打平时用随机数打散。
-
-    最后这个random tie-break是临时诊断手段：之前怀疑CI在早期港口的不均衡
-    （某些zone作业量为0）不是真实约束导致的，而是choices字典按bay从小到大
-    插入、min()对打平的情况总是确定性地选第一个遇到的（也就是bay index最小的）
-    这个副作用——只要有大量对称打平的情况（比如船刚出发、大部分格子还没被
-    reefer/hold-deck这些维度区分开），就会系统性地把货堆进低bay index，
-    跟真实的CI优劣无关。加这个random纯粹是为了验证这个假设：如果加了之后
-    早期港口的CI明显变化（不管变好变坏，只要不再是原来那种整zone为0的模式），
-    就说明之前的分布确实是遍历顺序的副作用，不是真实约束；
-    确认之后这里要换成真正的CI打分，而不是长期依赖random。
+    再按CI边际代价升序（往这个bay放，本港最挤的相邻bay对会变多大，越小越好），
+    组内最后按候选集大小升序，全部打平时用随机数打散（避免choices字典按bay
+    从小到大插入、min()对打平情况总是确定性选第一个这个副作用，之前验证过
+    这个副作用确实存在——加了这个随机tie-break之后CI有明显变化）。
     返回 (bay, lr, hd)
     """
     def priority(item):
@@ -55,7 +67,8 @@ def mrv_select(choices: dict, vessel: Vessel):
         has_rf_need = vessel.has_reefer[bay, lr, hd] and any(
             current_cbf[pod].get("RF", 0) > 0 for pod in cands
         )
-        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, len(cands), random.random())
+        ci_cost = _ci_marginal_cost(vessel, bay, lr, hd)
+        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, ci_cost, len(cands), random.random())
 
     return min(choices.items(), key=priority)[0]
 
@@ -112,9 +125,12 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
     # 当前港装完 → 换港
     if vessel.port_complete():
         snapshots[vessel.current_pol] = vessel.snapshot()
+        prev_port_bay_load = vessel.current_port_bay_load.copy()
+        # 备份换港前的负载表，这一港如果整体失败要精确恢复，不能留着新港口的脏状态
 
         vessel.advance_pol()
         discharged = vessel.discharge(vessel.current_pol)
+        vessel.reset_port_bay_load(discharged)
 
         if solve(vessel, is_debug, snapshots, best):
             return True
@@ -122,6 +138,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
         # 下一港失败，回溯
         vessel.undischarge(discharged)
         vessel.current_pol -= 1
+        vessel.current_port_bay_load = prev_port_bay_load
         del snapshots[vessel.current_pol]
 
         if is_debug:

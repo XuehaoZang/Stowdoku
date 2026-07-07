@@ -60,6 +60,11 @@ class Vessel:
         self.n_bay = self.is_valid.shape[0]
         # 搜索空间的bay数量，测试时按传入的full_slot_table定，STSE时7
 
+        self.current_port_bay_load = np.zeros(self.n_bay, dtype=int)
+        # current_port_bay_load[bay]: 当前港口这个bay累计的吊车作业量
+        # （卸箱+本港装箱），供CSP_solver的CI打分用。换港时通过reset_port_bay_load
+        # 重置为新港口的卸箱量，之后assign/unassign原地增减，不重新扫全船。
+
         # ── 动态状态层（搜索变量） ─────────────────────────────────────
 
         self.cell = np.empty((self.n_bay, 2, 2), dtype=object)
@@ -212,6 +217,7 @@ class Vessel:
         }
         self.cbf[self.current_pol][pod]["RF"] = rf_remaining - rf_used
         self.cbf[self.current_pol][pod]["GP"] = gp_remaining - gp_used
+        self.current_port_bay_load[bay] += gp_used + rf_used
 
         # print(f"[assign] POL={self.current_pol} POD={pod} cell=({bay},{lr},{hd}) "
         #       f"装GP={gp_used} 装RF={rf_used}  →  剩余cbf[POD={pod}]="
@@ -222,6 +228,7 @@ class Vessel:
         record = self.cell[bay, lr, hd]
         self.cbf[self.current_pol][pod]["RF"] = self.cbf[self.current_pol][pod].get("RF", 0) + record["RF_count"]
         self.cbf[self.current_pol][pod]["GP"] = self.cbf[self.current_pol][pod].get("GP", 0) + record["GP_count"]
+        self.current_port_bay_load[bay] -= record["GP_count"] + record["RF_count"]
         self.cell[bay, lr, hd] = dict(self._EMPTY_RECORD)
 
     # ── 多港口 ─────────────────────────────────────────────────────────
@@ -247,6 +254,16 @@ class Vessel:
         """精确恢复discharge的cell，不动cbf。"""
         for bay, lr, hd, record in discharged:
             self.cell[bay, lr, hd] = dict(record)
+
+    def reset_port_bay_load(self, discharged: list):
+        """换港后调用：把current_port_bay_load重置为这一港的初始卸箱量
+        （按bay汇总discharge()返回的记录），后续assign/unassign在此基础上
+        累加/累减本港新装的部分。回溯时如果这一港整体失败，调用方需要自己
+        把current_port_bay_load恢复成换港前的备份，这个方法不负责回溯。
+        """
+        self.current_port_bay_load = np.zeros(self.n_bay, dtype=int)
+        for bay, lr, hd, record in discharged:
+            self.current_port_bay_load[bay] += record["GP_count"] + record["RF_count"]
 
     def advance_pol(self):
         """换港：current_pol指针+1。"""
@@ -420,14 +437,7 @@ class Vessel:
         可能是capacity取整产生的余量（正数=没放完，负数=capacity超出实际需求的超额扣减），
         不影响已完成的求解结果，也不在这里做任何修正。
         """
-        print("[export_bayplan] 各POL剩余cbf（0表示刚好分配完）：")
-        for pol, pod_counts in sorted(self.cbf.items()):
-            leftover = {
-                pod: counts for pod, counts in pod_counts.items()
-                if counts.get("GP", 0) != 0 or counts.get("RF", 0) != 0
-            }
-            if leftover:
-                print(f"  POL={pol}: {leftover}")
+        print("[export_bayplan]")
 
         from utils.viz import plot_bayplan, _default_port_colors
 
