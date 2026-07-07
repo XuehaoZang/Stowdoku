@@ -22,6 +22,10 @@ from utils.vessel_io import (
 )
 from VesselClass import Vessel
 from CSP_solver import solve
+from utils.evaluate import evaluate_crane_intensity, evaluate_pod_leverage
+
+CRANE_NUMBER = 3
+# 港口吊车数量，作为evaluate_crane_intensity的参数，以后要是船公司变了配置，改这一个常量就够
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
 GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
@@ -70,7 +74,9 @@ def main():
     cbf_json_path = ensure_cbf()
 
     vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
-    
+    original_cbf = copy.deepcopy(vessel.cbf)
+    # solve()会原地扣减vessel.cbf，留一份原始计划量给evaluate_pod_leverage分析杠杆结构用
+
     snapshots = {}
     best = {"assigned": -1, "vessel": None}
     success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
@@ -104,7 +110,13 @@ def main():
                     port_label = PORT_NAMES.get(pod, pod)
                     print(f"    POL={pol} POD={port_label}: {counts}")
 
-    paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, port_names=PORT_NAMES, if_plot_phy=True)
+    if snapshots:
+        evaluate_crane_intensity(vessel, snapshots, crane_number=CRANE_NUMBER, port_names=PORT_NAMES)
+    else:
+        print("\n[evaluate] 没有完整的逐港snapshots（求解失败且未走到任何一港完成），跳过CI评估")
+    evaluate_pod_leverage(original_cbf)
+
+    paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, port_names=PORT_NAMES, if_plot_phy=False)
     print(f"Exported {len(paths)} bayplan files to {BAYPLAN_DIR}")
     
 

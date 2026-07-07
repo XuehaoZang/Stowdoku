@@ -1,5 +1,6 @@
 import numpy as np
 import copy
+import random
 from VesselClass import Vessel
 from utils.viz import print_vessel
 # import sys
@@ -35,9 +36,18 @@ def mrv_select(choices: dict, vessel: Vessel):
     MRV选择：优先has_reefer且候选中有POD真的还需要RF的cell（保证冰箱能放），
     其次优先hold(hd=0)而非deck(hd=1)——hold一旦被deck盖住就永久锁死，
     先填hold能避免不必要地触发舱盖约束、减少回溯，
-    组内最后按候选集大小升序。
+    组内最后按候选集大小升序，候选集大小也打平时用随机数打散。
+
+    最后这个random tie-break是临时诊断手段：之前怀疑CI在早期港口的不均衡
+    （某些zone作业量为0）不是真实约束导致的，而是choices字典按bay从小到大
+    插入、min()对打平的情况总是确定性地选第一个遇到的（也就是bay index最小的）
+    这个副作用——只要有大量对称打平的情况（比如船刚出发、大部分格子还没被
+    reefer/hold-deck这些维度区分开），就会系统性地把货堆进低bay index，
+    跟真实的CI优劣无关。加这个random纯粹是为了验证这个假设：如果加了之后
+    早期港口的CI明显变化（不管变好变坏，只要不再是原来那种整zone为0的模式），
+    就说明之前的分布确实是遍历顺序的副作用，不是真实约束；
+    确认之后这里要换成真正的CI打分，而不是长期依赖random。
     返回 (bay, lr, hd)
-    # TODO 从candidate最少的开始选？能不能引入CI来引导？
     """
     def priority(item):
         (bay, lr, hd), cands = item
@@ -45,7 +55,7 @@ def mrv_select(choices: dict, vessel: Vessel):
         has_rf_need = vessel.has_reefer[bay, lr, hd] and any(
             current_cbf[pod].get("RF", 0) > 0 for pod in cands
         )
-        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, len(cands))
+        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, len(cands), random.random())
 
     return min(choices.items(), key=priority)[0]
 
