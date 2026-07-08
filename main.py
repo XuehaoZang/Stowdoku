@@ -71,13 +71,6 @@ def tag_hicube_allocation(self, snapshots: dict, original_cbf: dict, hc_order="c
     只在已装槽位里追加GP_HC_count/RF_HC_count两个字段，标明这些槽位里哪些算高箱。
     RF_HC只能从这个cell的RF_count槽位里贴（reefer插座限制仍在），
     GP_HC只能从GP_count槽位里贴，两者共享同一个cell的capacity_hc上限。
-    original_cbf: solve()跑之前的cbf深拷贝（如__main__里的vessel_init.cbf），
-    用来读每个(POL,POD)原始的HC/HR需求量——snapshots里的cbf已经是assign()扣减后的余量，
-    不能拿来当"原始需求"用。
-    hc_order: 同一个POD跨多个cell时的喂入顺序，"cap_desc"=按这个cell的capacity_hc余量降序
-    （默认；平均分配等策略以后可扩展这个参数，这里暂不实现）。
-    打印每个(POL,POD)的原始HC/HR需求 vs 实际贴上标签数 vs 缺口（缺口如实报告，
-    贴不上的槽位保持原样降级为普通标签，不吞掉）。
     """
     for pol, snap in sorted(snapshots.items()):
         cell = snap["cell"]
@@ -113,6 +106,10 @@ def tag_hicube_allocation(self, snapshots: dict, original_cbf: dict, hc_order="c
             print(f"POL={pol} POD={pod}: HC需求={hc_need}, 已贴标={hc_need - hc_remaining}, "
                   f"缺口={hc_remaining}  |  HR(冷藏高箱)需求={rf_hc_need}, "
                   f"已贴标={rf_hc_need - rf_hc_remaining}, 缺口={rf_hc_remaining}")
+            total_slots = sum(record["GP_count"] + record["RF_count"] for _, _, _, record in cells)
+            total_demand = sum(demand.get(k, 0) for k in ("GP", "HC", "RF", "HR"))
+            print(f"POL={pol} POD={pod}: 总分配槽位={total_slots}, 原始总demand={total_demand}"
+                f"{'  ← 槽位本身没分够，HC缺口不能全怪capacity_hc' if total_slots < total_demand else ''}")
 
 def main():
     import copy
@@ -145,7 +142,7 @@ def main():
         return
 
     remaining_total = sum(
-        counts.get("GP", 0) + counts.get("RF", 0)
+        counts.get("GP", 0) + counts.get("RF", 0) + counts.get("HC", 0) + counts.get("HR", 0)
         for pod_dict in result_vessel.cbf.values()
         for counts in pod_dict.values()
     )
@@ -154,7 +151,7 @@ def main():
         print("\n尾货cbf明细：")
         for pol, pod_dict in sorted(result_vessel.cbf.items()):
             for pod, counts in sorted(pod_dict.items()):
-                if counts.get("GP", 0) > 0 or counts.get("RF", 0) > 0:
+                if counts.get("GP", 0) > 0 or counts.get("RF", 0) > 0 or counts.get("HC", 0) > 0 or counts.get("HR", 0) > 0:
                     port_label = PORT_NAMES.get(pod, pod)
                     print(f"    POL={pol} POD={port_label}: {counts}")
 

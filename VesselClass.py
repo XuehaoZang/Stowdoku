@@ -53,9 +53,9 @@ class Vessel:
         # capacity_rf[bay][lr][hd]: 该cell内有RF插座的槽位数
         # 用于RF类型赋值时的cbf扣减量
         
-        self.capacity_hc = self._derive_capacity_hc(self.capacity_total)
-        # capacity_hc[bay][lr][hd]: 该cell内高箱(HC/HR)槽位上限
-        # hold(hd=0): min(N,2)；deck(hd=1): N-1。
+        self.capacity_hc = self._derive_capacity_hc(full_slot_table)
+        # capacity_hc[bay][lr][hd]: 该cell内高箱(HC/HR)槽位上限。
+        # hold每row: min(n,2)；deck每row: n-1（n=这一摞的can_40ft槽位数）
 
         self.has_reefer = self.capacity_rf > 0
         # has_reefer[bay][lr][hd]: bool，由capacity_rf推导，方便候选集过滤
@@ -127,11 +127,24 @@ class Vessel:
         return cls(full_slot_table=slots, cbf=cbf, current_pol=current_pol)
 
     @staticmethod
-    def _derive_capacity_hc(capacity_total: np.ndarray) -> np.ndarray:
-            capacity_hc = np.zeros_like(capacity_total)
-            capacity_hc[:, :, 0] = np.minimum(capacity_total[:, :, 0], 2)
-            capacity_hc[:, :, 1] = np.maximum(capacity_total[:, :, 1] - 1, 0)
-            return capacity_hc.astype(int)
+    def _derive_capacity_hc(slots: pd.DataFrame) -> np.ndarray:
+        """
+        按(bay_idx, row_idx, lr, hd)分组算出每一row的can_40ft槽位数n，然后按经验公式：
+            hold(hd=0): 每摞 min(n, 2)
+            deck(hd=1): 每摞 n - 1
+        """
+        capacity_hc = np.zeros((N_BAY, 2, 2), dtype=int)
+        can40 = slots[slots["can_40ft"]]
+
+        stack_counts = can40.groupby(["bay_idx", "row_idx", "lr", "hd"]).size()
+        for (bay_idx, row_idx, lr, hd), n in stack_counts.items():
+            big_bay = _BIG_BAY_OF_B0.get(bay_idx)
+            if big_bay is None:
+                continue
+            stack_hc = min(n, 2) if hd == 0 else max(n - 1, 0)
+            capacity_hc[big_bay, lr, hd] += stack_hc
+
+        return capacity_hc.astype(int)
         
     # ── 查询方法 ───────────────────────────────────────────────────────
 
@@ -231,6 +244,8 @@ class Vessel:
         demand["RF"] = rf_demand - rf_deduct_rf
         demand["HR"] = hr_demand - rf_deduct_hr
 
+        self.current_port_bay_load[bay] += gp_used + rf_used
+
     def unassign(self, bay, lr, hd, pod):
         record = self.cell[bay, lr, hd]
         demand = self.cbf[self.current_pol][pod]
@@ -238,6 +253,9 @@ class Vessel:
         demand["HC"] = demand.get("HC", 0) + record["_gp_from_hc"]
         demand["RF"] = demand.get("RF", 0) + record["_rf_from_rf"]
         demand["HR"] = demand.get("HR", 0) + record["_rf_from_hr"]
+
+        self.current_port_bay_load[bay] -= record["GP_count"] + record["RF_count"]
+
         self.cell[bay, lr, hd] = dict(self._EMPTY_RECORD)
 
     # ── 多港口 ─────────────────────────────────────────────────────────
