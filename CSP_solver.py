@@ -51,7 +51,7 @@ def mrv_select(choices: dict, vessel: Vessel):
     选格子阶段:
     1. 特殊箱判断       -->  优先看has_reefer的（当仍有Reefer需求时）  --> 剪枝：放完GP但是RF放不了
     2. 封舱判断         -->  优先看hold 或 已占用hold上deck           --> 剪枝：直接装完deck导致封舱
-    3. 高箱判断         -->  优先看has_hicube的（当仍有HC需求时）      --> 剪枝：分配的位置放不进这么多高箱(TODO 需要进一步实现，并且修改投影规则+可视化等)
+    （待定3. 高箱判断         -->  优先看has_hicube的（当仍有HC需求时）      --> 剪枝：分配的位置放不进这么多高箱(TODO 需要进一步实现，并且修改投影规则+可视化等)）
     4. 候选集排序       -->  优先看候选可能最少的                      --> 剪枝：加快搜索
     5. 随机数打散
     返回 (bay, lr, hd)
@@ -60,29 +60,40 @@ def mrv_select(choices: dict, vessel: Vessel):
         (bay, lr, hd), cands = item
         current_cbf = vessel.cbf[vessel.current_pol]
         has_rf_need = vessel.has_reefer[bay, lr, hd] and any(
-            current_cbf[pod].get("RF", 0) > 0 for pod in cands
+            current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0 for pod in cands
         )
-        ci_cost = _ci_marginal_cost(vessel, bay, lr, hd)
-        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, ci_cost, len(cands), random.random())
+        is_dead_slot = hd == 1 and vessel.cell[bay, lr, 0]["POD"] == -1
+        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, len(cands), random.random())
 
     return min(choices.items(), key=priority)[0]
-
 
 def _pod_try_order(cands, vessel, bay, lr, hd):
     """
     选箱子来填格子阶段：_pod_try_order
-    1. 特殊箱判断：高箱/reefer的具体匹配（TODO 高箱部分需要实现）
-    2. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）（TODO CI评估函数部分需要继续推敲）
-    3. 箱重匹配（旨在让空箱上浮（甲板上堆高）重箱下沉（舱底））（TODO 未来实现）
-    4. 重量平衡（往这个bay放POD=?的箱子可以改善重量平衡？）（TODO 未来实现）
-    5. 按照POD rel_rank降序（先装目的地远的箱子 TODO 先远后近是好的策略吗）
+    1. 特殊箱匹配：哪个港口有reefer箱子，根据格子的冰箱容量进行匹配
+    2. 高箱匹配：(POD剩余需求里HC+HR占比)X(cell的capacity_hc占比)作为分数，量化了高箱需求和容量的匹配度。
+    3. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）（TODO CI评估函数部分需要继续推敲）
+    4. 箱重匹配（旨在让空箱上浮（甲板上堆高）重箱下沉（舱底））（TODO 未来实现）
+    5. 重量平衡（往这个bay放POD=?的箱子可以改善重量平衡？）（TODO 未来实现）
+    6. 按照POD rel_rank降序（先装目的地远的箱子 TODO 先远后近是好的策略吗）
     """
     current_cbf = vessel.cbf[vessel.current_pol]
     has_reefer_here = vessel.has_reefer[bay, lr, hd]
 
+    cap_total_here = vessel.capacity_total[bay, lr, hd]
+    cap_hc_here = vessel.capacity_hc[bay, lr, hd]
+    hc_capacity_ratio = (cap_hc_here / cap_total_here) if cap_total_here > 0 else 0.0
+
     def key(pod):
-        rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) > 0
-        return (0 if rf_need else 1, pod)
+        rf_need = has_reefer_here and (current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0)) > 0
+
+        demand = current_cbf[pod]
+        total_demand = sum(demand.get(k, 0) for k in ("GP", "HC", "RF", "HR"))
+        hc_demand_ratio = ((demand.get("HC", 0) + demand.get("HR", 0)) / total_demand
+                            if total_demand > 0 else 0.0)
+        hc_match_score = hc_demand_ratio * hc_capacity_ratio
+
+        return (0 if rf_need else 1, -hc_match_score, pod)
 
     return sorted(cands, key=key)
 
@@ -124,7 +135,6 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
     if vessel.port_complete():
         snapshots[vessel.current_pol] = vessel.snapshot()
         prev_port_bay_load = vessel.current_port_bay_load.copy()
-        # 备份换港前的负载表，这一港如果整体失败要精确恢复，不能留着新港口的脏状态
 
         vessel.advance_pol()
         discharged = vessel.discharge(vessel.current_pol)

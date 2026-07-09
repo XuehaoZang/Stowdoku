@@ -198,7 +198,8 @@ class Vessel:
     def remaining_pods(self) -> set:
         return {
             pod for pod, counts in self.cbf[self.current_pol].items()
-            if sum(counts.get(k, 0) for k in ("GP", "HC", "RF", "HR")) > self.tail_threshold
+            if (counts.get("GP", 0) + counts.get("HC", 0)) > self.tail_threshold
+            or (counts.get("RF", 0) + counts.get("HR", 0)) > 0
         }
 
     def port_complete(self) -> bool:
