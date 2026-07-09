@@ -66,12 +66,9 @@ def ensure_cbf() -> str:
     return CBF_JSON
 
 def tag_hicube_allocation(self, snapshots: dict, original_cbf: dict, hc_order="cap_desc"):
-    """
-    全部港口解完后的高箱贴标签。不修改GP_count/RF_count（分配数量本身不受影响），
-    只在已装槽位里追加GP_HC_count/RF_HC_count两个字段，标明这些槽位里哪些算高箱。
-    RF_HC只能从这个cell的RF_count槽位里贴（reefer插座限制仍在），
-    GP_HC只能从GP_count槽位里贴，两者共享同一个cell的capacity_hc上限。
-    """
+    grand_total = {"hc_need": 0, "hc_gap": 0, "hr_need": 0, "hr_gap": 0,
+                   "slots_short": 0, "n_pod_with_gap": 0}
+
     for pol, snap in sorted(snapshots.items()):
         cell = snap["cell"]
         pod_cells = {}
@@ -81,6 +78,10 @@ def tag_hicube_allocation(self, snapshots: dict, original_cbf: dict, hc_order="c
                     record = cell[bay, lr, hd]
                     if record["POD"] != -1:
                         pod_cells.setdefault(record["POD"], []).append((bay, lr, hd, record))
+
+        pol_totals = {"hc_need": 0, "hc_tagged": 0, "hr_need": 0, "hr_tagged": 0,
+                      "total_slots": 0, "total_demand": 0}
+        gap_lines = []  # 只收集有缺口的POD，逐条打印，避免刷屏
 
         for pod, cells in sorted(pod_cells.items()):
             demand = original_cbf.get(pol, {}).get(pod, {})
@@ -93,23 +94,51 @@ def tag_hicube_allocation(self, snapshots: dict, original_cbf: dict, hc_order="c
 
             for bay, lr, hd, record in cells:
                 cap_hc = self.capacity_hc[bay, lr, hd]
-
                 rf_hc_used = min(rf_hc_remaining, record["RF_count"], cap_hc)
                 gp_hc_used = min(hc_remaining, record["GP_count"], cap_hc - rf_hc_used)
-
                 record["RF_HC_count"] = rf_hc_used
                 record["GP_HC_count"] = gp_hc_used
-
                 rf_hc_remaining -= rf_hc_used
                 hc_remaining -= gp_hc_used
 
-            print(f"POL={pol} POD={pod}: HC需求={hc_need}, 已贴标={hc_need - hc_remaining}, "
-                  f"缺口={hc_remaining}  |  HR(冷藏高箱)需求={rf_hc_need}, "
-                  f"已贴标={rf_hc_need - rf_hc_remaining}, 缺口={rf_hc_remaining}")
-            total_slots = sum(record["GP_count"] + record["RF_count"] for _, _, _, record in cells)
+            total_slots = sum(r["GP_count"] + r["RF_count"] for _, _, _, r in cells)
             total_demand = sum(demand.get(k, 0) for k in ("GP", "HC", "RF", "HR"))
-            print(f"POL={pol} POD={pod}: 总分配槽位={total_slots}, 原始总demand={total_demand}"
-                f"{'  ← 槽位本身没分够，HC缺口不能全怪capacity_hc' if total_slots < total_demand else ''}")
+
+            pol_totals["hc_need"] += hc_need
+            pol_totals["hc_tagged"] += hc_need - hc_remaining
+            pol_totals["hr_need"] += rf_hc_need
+            pol_totals["hr_tagged"] += rf_hc_need - rf_hc_remaining
+            pol_totals["total_slots"] += total_slots
+            pol_totals["total_demand"] += total_demand
+
+            gap = hc_remaining + rf_hc_remaining
+            if gap > 0:
+                slots_short = max(total_demand - total_slots, 0)
+                gap_lines.append(
+                    f"    POD={pod}: HC缺口={hc_remaining}(需{hc_need}) "
+                    f"HR缺口={rf_hc_remaining}(需{rf_hc_need}) "
+                    f"槽位未分够={slots_short}"
+                )
+
+        hc_gap = pol_totals["hc_need"] - pol_totals["hc_tagged"]
+        hr_gap = pol_totals["hr_need"] - pol_totals["hr_tagged"]
+        slots_short_total = max(pol_totals["total_demand"] - pol_totals["total_slots"], 0)
+        print(f"POL={pol}: HC需求={pol_totals['hc_need']} 已贴标={pol_totals['hc_tagged']} 缺口={hc_gap}  |  "
+              f"HR需求={pol_totals['hr_need']} 已贴标={pol_totals['hr_tagged']} 缺口={hr_gap}  |  "
+              f"本港总槽位未分够={slots_short_total}  |  有缺口的POD数={len(gap_lines)}")
+        for line in gap_lines:
+            print(line)
+
+        grand_total["hc_need"] += pol_totals["hc_need"]
+        grand_total["hc_gap"] += hc_gap
+        grand_total["hr_need"] += pol_totals["hr_need"]
+        grand_total["hr_gap"] += hr_gap
+        grand_total["slots_short"] += slots_short_total
+        grand_total["n_pod_with_gap"] += len(gap_lines)
+
+    print(f"\n[全航次汇总] HC需求={grand_total['hc_need']} 总缺口={grand_total['hc_gap']}  |  "
+          f"HR需求={grand_total['hr_need']} 总缺口={grand_total['hr_gap']}  |  "
+          f"总槽位未分够={grand_total['slots_short']}  |  有缺口的POD-港口对数={grand_total['n_pod_with_gap']}")
 
 def main():
     import copy
@@ -124,7 +153,7 @@ def main():
 
     snapshots = {}
     best = {"assigned": -1, "vessel": None}
-    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, if_match_HC=False)
 
     if success:
         result_vessel = vessel
@@ -163,8 +192,8 @@ def main():
     
     tag_hicube_allocation(vessel, snapshots, original_cbf)
 
-    paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, port_names=PORT_NAMES, if_plot_phy=False)
-    print(f"Exported {len(paths)} bayplan files to {BAYPLAN_DIR}")
+    # paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, port_names=PORT_NAMES, if_plot_phy=False)
+    # print(f"Exported {len(paths)} bayplan files to {BAYPLAN_DIR}")
     
 
 if __name__ == "__main__":

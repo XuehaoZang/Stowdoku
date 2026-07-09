@@ -216,8 +216,8 @@ class Vessel:
 
     # ── 赋值与撤销 ─────────────────────────────────────────────────────
     def assign(self, bay, lr, hd, pod):
-        cap_total = self.capacity_total[bay, lr, hd]
-        cap_rf = self.capacity_rf[bay, lr, hd]
+        cap_total = int(self.capacity_total[bay, lr, hd])
+        cap_rf = int(self.capacity_rf[bay, lr, hd])
 
         demand = self.cbf[self.current_pol][pod]
         rf_demand, hr_demand = demand.get("RF", 0), demand.get("HR", 0)

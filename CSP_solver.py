@@ -63,11 +63,11 @@ def mrv_select(choices: dict, vessel: Vessel):
             current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0 for pod in cands
         )
         is_dead_slot = hd == 1 and vessel.cell[bay, lr, 0]["POD"] == -1
-        return (0 if has_rf_need else 1, 0 if hd == 0 else 1, len(cands), random.random())
+        return (0 if has_rf_need else 1, 0 if not is_dead_slot else 1, len(cands), random.random())
 
     return min(choices.items(), key=priority)[0]
 
-def _pod_try_order(cands, vessel, bay, lr, hd):
+def _pod_try_order(cands, vessel, bay, lr, hd, if_match_HC=True):
     """
     选箱子来填格子阶段：_pod_try_order
     1. 特殊箱匹配：哪个港口有reefer箱子，根据格子的冰箱容量进行匹配
@@ -79,6 +79,12 @@ def _pod_try_order(cands, vessel, bay, lr, hd):
     """
     current_cbf = vessel.cbf[vessel.current_pol]
     has_reefer_here = vessel.has_reefer[bay, lr, hd]
+
+    if not if_match_HC:
+        def key(pod):
+            rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
+            return (0 if rf_need else 1, pod)
+        return sorted(cands, key=key)
 
     cap_total_here = vessel.capacity_total[bay, lr, hd]
     cap_hc_here = vessel.capacity_hc[bay, lr, hd]
@@ -110,7 +116,7 @@ def _total_assigned(vessel: Vessel) -> int:
 
 _solve_call_count = [0]
 
-def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
+def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, if_match_HC=True) -> bool:
     """
     统一大递归：装载 + 换港，discharge作为递归中的特殊节点。
     vessel内部维护current_pol和cbf状态。
@@ -118,9 +124,9 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
           记录搜索过程中见过的、已装箱数最多的状态快照，用于失败时输出最优近似解。
     """
     _solve_call_count[0] += 1
-    # if _solve_call_count[0] % 500 == 0:
-    #     print(f"[depth debug] 已调用{_solve_call_count[0]}次, current_pol={vessel.current_pol}, "
-    #           f"total_remaining={vessel.total_remaining()}")
+    if _solve_call_count[0] % 100000 == 0:
+        print(f"[depth debug] 已调用{_solve_call_count[0]}次, current_pol={vessel.current_pol}, "
+              f"total_remaining={vessel.total_remaining()}")
     
     if snapshots is None:
         snapshots = {}
@@ -140,7 +146,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
         discharged = vessel.discharge(vessel.current_pol)
         vessel.reset_port_bay_load(discharged)
 
-        if solve(vessel, is_debug, snapshots, best):
+        if solve(vessel, is_debug, snapshots, best, if_match_HC):
             return True
 
         # 下一港失败，回溯
@@ -161,13 +167,13 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
     if not choices:
         # 所有空cell的cbf候选都已耗尽，等价于port_complete
         # 下一次递归开头的port_complete()会处理换港
-        return solve(vessel, is_debug, snapshots, best)
+        return solve(vessel, is_debug, snapshots, best, if_match_HC)
 
     # MRV选位置
     pos = mrv_select(choices, vessel)
     bay, lr, hd = pos
 
-    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd):
+    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd, if_match_HC):
         vessel.assign(bay, lr, hd, pod)
 
         current_total = _total_assigned(vessel)
@@ -175,7 +181,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
             best["assigned"] = current_total
             best["vessel"] = copy.deepcopy(vessel)
 
-        if solve(vessel, is_debug, snapshots, best):
+        if solve(vessel, is_debug, snapshots, best, if_match_HC):
             return True
 
         vessel.unassign(bay, lr, hd, pod)
