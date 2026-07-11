@@ -108,6 +108,12 @@ class Vessel:
         # 按bay_capacity_share分摊"应得预算"用。换港时在reset_port_bay_load里
         # 用同样的方式重新赋值。
 
+        self._hc_cbf_writeback_seen = set()
+        # proj_cell_to_vessel记账去重用：{(POL, POD), ...}。同一批货物在被discharge
+        # 之前会原样出现在它装船后所有后续POL的snapshot里，deck降级回退/预算分不完
+        # 回退这两处写self.cbf的副作用必须对同一个(POL,POD)分组只生效一次，
+        # 否则export_bayplan对每个POL都调用一次proj_cell_to_vessel会导致重复计入。
+
     # ── 构造 ───────────────────────────────────────────────────────────
 
     @classmethod
@@ -136,11 +142,22 @@ class Vessel:
         return cls(full_slot_table=slots, cbf=cbf, current_pol=current_pol)
 
     @staticmethod
+    def _stack_hc_cap(n: int, hd: int) -> int:
+        """
+        一摞(同一row_idx方向叠放的can_40ft槽位集合)的HC容量上限，
+        _derive_capacity_hc(静态capacity_hc)和proj_cell_to_vessel(实际贴标签时
+        的stack_hc_remaining)都要用同一条公式，抽在这里只维护一份：
+            hold(hd=0): 纯配额 min(n, 2)
+            deck(hd=1): 阶跃式 n - 1（这一摞只要出现>=1个HC，占用数就从n降到
+                        n-1，不随HC数量继续增加而继续扣，n=这一摞的can_40ft槽位数）
+        """
+        return min(n, 2) if hd == 0 else max(n - 1, 0)
+
+    @staticmethod
     def _derive_capacity_hc(slots: pd.DataFrame) -> np.ndarray:
         """
-        按(bay_idx, row_idx, lr, hd)分组算出每一row的can_40ft槽位数n，然后按经验公式：
-            hold(hd=0): 每摞 min(n, 2)
-            deck(hd=1): 每摞 n - 1
+        按(bay_idx, row_idx, lr, hd)分组算出每一row的can_40ft槽位数n，
+        再用_stack_hc_cap(n, hd)算这一摞的HC容量上限，按big_bay累加。
         """
         capacity_hc = np.zeros((N_BAY, 2, 2), dtype=int)
         can40 = slots[slots["can_40ft"]]
@@ -150,8 +167,7 @@ class Vessel:
             big_bay = _BIG_BAY_OF_B0.get(bay_idx)
             if big_bay is None:
                 continue
-            stack_hc = min(n, 2) if hd == 0 else max(n - 1, 0)
-            capacity_hc[big_bay, lr, hd] += stack_hc
+            capacity_hc[big_bay, lr, hd] += Vessel._stack_hc_cap(n, hd)
 
         return capacity_hc.astype(int)
         
@@ -470,7 +486,7 @@ class Vessel:
                         idx_list.sort(key=lambda idx: slots.at[idx, "tier_idx"])
 
                     stack_hc_remaining = {
-                        row_idx: (min(len(idx_list), 2) if hd == 0 else max(len(idx_list) - 1, 0))
+                        row_idx: self._stack_hc_cap(len(idx_list), hd)
                         for row_idx, idx_list in row_groups.items()
                     }
                     row_order = sorted(row_groups.keys(), key=lambda r: stack_hc_remaining[r], reverse=True)
@@ -510,6 +526,11 @@ class Vessel:
             pod_groups.setdefault((info["pol"], info["pod"]), []).append(info)
 
         for (pol, pod), infos in pod_groups.items():
+            # 同一个(POL,POD)分组在被discharge之前会原样出现在后续每个POL的
+            # snapshot里，is_hc贴标签本身可以每次都重算(幂等)，但写回self.cbf
+            # 这个副作用只能对同一分组生效一次，否则会被重复计入。
+            already_written = (pol, pod) in self._hc_cbf_writeback_seen
+
             demand = original_cbf.get(pol, {}).get(pod, {})
             gp_hc_budget = demand.get("HC", 0)
             rf_hc_budget = demand.get("HR", 0)
@@ -595,15 +616,18 @@ class Vessel:
                             slots.at[target_idx, "RF_count"] = 0
                             slots.at[target_idx, "is_hc"] = False
 
-                        cbf_demand = self.cbf[pol][pod]
-                        cbf_demand["GP"] = cbf_demand.get("GP", 0) + 1
+                        if not already_written:
+                            cbf_demand = self.cbf[pol][pod]
+                            cbf_demand["GP"] = cbf_demand.get("GP", 0) + 1
 
-            if gp_hc_budget > 0 or rf_hc_budget > 0:
+            if not already_written and (gp_hc_budget > 0 or rf_hc_budget > 0):
                 # 预算池分不完——把这部分HC/HR demand回退进cbf余量，
                 # 跟真正没找到地方放的尾货合并存放。
                 cbf_demand = self.cbf[pol][pod]
                 cbf_demand["HC"] = cbf_demand.get("HC", 0) + gp_hc_budget
                 cbf_demand["HR"] = cbf_demand.get("HR", 0) + rf_hc_budget
+
+            self._hc_cbf_writeback_seen.add((pol, pod))
 
         return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
                       "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count", "is_hc"]]
