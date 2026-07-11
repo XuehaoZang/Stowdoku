@@ -632,7 +632,7 @@ class Vessel:
         return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
                       "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count", "is_hc"]]
 
-    def export_bayplan(self, snapshots: dict, out_dir: str, original_cbf: dict, port_names: dict = None, if_plot_phy: bool = False) -> list:
+    def export_bayplan(self, snapshots: dict, out_dir: str, original_cbf: dict, port_names: dict = None, if_csv: bool = False, if_plot_phy: bool = False) -> list:
         """
         遍历snapshots（solve()产出的{POL: snapshot_dict}），对每个POL调用proj_cell_to_vessel，
         存成{POL}_{港口码}_DEP_bayplan.csv，同时调用utils.viz.plot_bayplan画一张png，
@@ -669,10 +669,10 @@ class Vessel:
         for pol in sorted(snapshots.keys()):
             code = port_names.get(pol, str(pol)) if port_names else str(pol)
             df = self.proj_cell_to_vessel(cell_state=snapshots[pol], original_cbf=original_cbf)
-
-            csv_path = os.path.join(out_dir, f"{pol}_{code}_DEP_bayplan.csv")
-            df.to_csv(csv_path, index=False)
-            paths.append(csv_path)
+            if if_csv:
+                csv_path = os.path.join(out_dir, f"{pol}_{code}_DEP_bayplan.csv")
+                df.to_csv(csv_path, index=False)
+                paths.append(csv_path)
 
             png_paths = plot_bayplan(
                 df, title=f"POL={pol} ({code}) departure",

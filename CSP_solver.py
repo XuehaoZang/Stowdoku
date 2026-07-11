@@ -67,8 +67,7 @@ def mrv_select(choices: dict, vessel: Vessel, ci_enabled=True):
     选格子阶段:
     1. 特殊箱判断       -->  优先看has_reefer的（当仍有Reefer需求时）  --> 剪枝：放完GP但是RF放不了
     2. 封舱判断         -->  优先看hold 或 已占用hold上deck           --> 剪枝：直接装完deck导致封舱
-    （待定3. 高箱判断         -->  优先看has_hicube的（当仍有HC需求时）      --> 剪枝：分配的位置放不进这么多高箱(暂时不加高箱规则)）
-    4. CI评分           -->  优先看cell层CI评分较低的（不启用时恒为0）    --> 剪枝：避免把负荷堆到已经紧张的相邻bay对
+    3. CI评分           -->  优先看cell层对当前POL的影响（ci_enabled控制）    --> 剪枝：避免把负荷堆到已经紧张的相邻bay对
     5. 候选集排序       -->  优先看候选可能最少的                      --> 剪枝：加快搜索
     6. 随机数打散
     ci_enabled=False时用于消融实验，ci_score恒为0，排序退化成不含CI项的版本。

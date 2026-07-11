@@ -164,9 +164,11 @@ def _two_crane_port_schedule(bay_total: np.ndarray, crane_rate: float = 1.0) -> 
 # ── 对外评估函数 ─────────────────────────────────────────────────────
 
 def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, target_ci: float = 2,
-                              port_names: dict = None) -> list:
+                              port_names: dict = None, if_debug: bool = True) -> list:
     """
-    对solve()跑出来的snapshots逐港口计算实际CI值，打印一张表并返回明细。
+    对solve()跑出来的snapshots逐港口计算实际CI值，返回明细；if_debug=True时
+    额外打印一张逐港明细表（批量跑消融实验时可以传if_debug=False只取返回值、
+    不刷屏）。
 
     discharge_tally: 到达port X时船上POD==X的箱量(按bay)
                       = 紧邻X之前的那个departure快照里POD==X的记录
@@ -182,15 +184,16 @@ def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, target_ci: float =
     port_totals = _port_bay_totals(vessel, snapshots, port_names)
     results = [{**r, "ci": _ci_from_bay_totals(r["bay_total"])} for r in port_totals]
 
-    print(f"\n──── CI评估（相邻bay对滑窗定义, target_ci={target_ci}）────")
-    for r in results:
-        bay_str = " ".join(str(int(x)) for x in r["bay_total"])
-        if r["ci"] is None:
-            ci_str = "N/A(本港无吊车动作)"
-        else:
-            flag = "  ⚠️ 低于目标" if r["ci"] < target_ci else ""
-            ci_str = f"{r['ci']:.3f}{flag}"
-        print(f"  POL={r['pol']}({r['label']}): 各bay作业量=[{bay_str}]  CI={ci_str}")
+    if if_debug:
+        print(f"\n──── CI评估（相邻bay对滑窗定义, target_ci={target_ci}）────")
+        for r in results:
+            bay_str = " ".join(str(int(x)) for x in r["bay_total"])
+            if r["ci"] is None:
+                ci_str = "N/A(本港无吊车动作)"
+            else:
+                flag = "  ⚠️ 低于目标" if r["ci"] < target_ci else ""
+                ci_str = f"{r['ci']:.3f}{flag}"
+            print(f"  POL={r['pol']}({r['label']}): 各bay作业量=[{bay_str}]  CI={ci_str}")
 
     return results
 
@@ -215,7 +218,7 @@ def evaluate_ci_theoretical_ceiling(vessel: Vessel) -> float:
 
 
 def evaluate_crane_time(vessel: Vessel, snapshots: dict, k: int = 2, crane_rate: float = 1.0,
-                         port_names: dict = None) -> list:
+                         port_names: dict = None, if_debug: bool = True) -> list:
     """
     在evaluate_crane_intensity同一份bay_total基础上，模拟k台吊车按bay升序顺序
     作业、遇到相邻bay冲突就等待的排班过程，估算每港实际耗时Time_port，以及
@@ -226,9 +229,10 @@ def evaluate_crane_time(vessel: Vessel, snapshots: dict, k: int = 2, crane_rate:
     （见_two_crane_port_schedule）。crane_rate：单位作业量对应的耗时倍率的倒数
     （crane_rate=1.0时，作业量数字本身就是耗时单位）。
 
-    每港打印吊车1/2的作业时间(work，不含等待)、阻塞时间(wait，只有crane1可能
-    非0——这是"都按bay升序处理"的顺序假设下的直接推论，不做对称化)、这一港
-    总耗时(Time_port=makespan)；全部港口跑完后打印Total_voyage_time。
+    if_debug=True时逐港打印吊车1/2的作业时间(work，不含等待)、阻塞时间(wait，
+    只有crane1可能非0——这是"都按bay升序处理"的顺序假设下的直接推论，不做
+    对称化)、这一港总耗时(Time_port=makespan)，以及最后的Total_voyage_time；
+    批量跑消融实验时可以传if_debug=False只取返回值、不刷屏。
     """
     if k != 2:
         raise NotImplementedError("evaluate_crane_time目前只实现k=2的排班逻辑")
@@ -236,19 +240,22 @@ def evaluate_crane_time(vessel: Vessel, snapshots: dict, k: int = 2, crane_rate:
     port_totals = _port_bay_totals(vessel, snapshots, port_names)
 
     results = []
-    print(f"\n──── 吊车作业耗时评估（k={k}台吊车, crane_rate={crane_rate}）────")
+    if if_debug:
+        print(f"\n──── 吊车作业耗时评估（k={k}台吊车, crane_rate={crane_rate}）────")
     for r in port_totals:
         sched = _two_crane_port_schedule(r["bay_total"], crane_rate=crane_rate)
         time_port = sched["makespan"]
         results.append({**r, **sched, "time_port": time_port})
 
-        print(f"  POL={r['pol']}({r['label']}): 切分点={sched['split']}  "
-              f"吊车1[作业={sched['work1']:.1f} 阻塞={sched['wait1']:.1f}]  "
-              f"吊车2[作业={sched['work2']:.1f} 阻塞={sched['wait2']:.1f}]  "
-              f"Time_port={time_port:.1f}")
+        if if_debug:
+            print(f"  POL={r['pol']}({r['label']}): 切分点={sched['split']}  "
+                  f"吊车1[作业={sched['work1']:.1f} 阻塞={sched['wait1']:.1f}]  "
+                  f"吊车2[作业={sched['work2']:.1f} 阻塞={sched['wait2']:.1f}]  "
+                  f"Time_port={time_port:.1f}")
 
     total_voyage_time = sum(r["time_port"] for r in results)
-    print(f"\n  Total_voyage_time(全程总时间) = {total_voyage_time:.1f}")
+    if if_debug:
+        print(f"\n  Total_voyage_time(全程总时间) = {total_voyage_time:.1f}")
 
     return results
 

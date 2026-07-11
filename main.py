@@ -15,6 +15,12 @@ main.py - 编排入口，负责数据准备 + 求解 + 导出的完整流水线
 """
 
 import os
+import random
+import copy
+import time
+
+import numpy as np
+import pandas as pd
 
 from utils.vessel_io import (
     build_vessel_geometry, find_can_40ft, find_can_20ft, find_can_reefer,
@@ -22,17 +28,7 @@ from utils.vessel_io import (
 )
 from VesselClass import Vessel
 from CSP_solver import solve
-from utils.evaluate import (
-    evaluate_crane_intensity, evaluate_ci_theoretical_ceiling, evaluate_crane_time,
-    evaluate_pod_leverage,
-)
-
-TARGET_CI = 2.0
-# CI目标基准，对应总作业量500以内、完全均匀分布下相邻bay对占比2/n_bay的理论值
-# 不是硬约束，只是打印时用来标注"低于目标"，不同总量级别可能需要另外校准
-
-CI_ENABLED = True
-# 消融实验开关，透传给solve()->mrv_select，控制cell层CI评分是否启用
+from utils.evaluate import evaluate_crane_time
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
 GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
@@ -72,61 +68,101 @@ def ensure_cbf() -> str:
     return CBF_JSON
 
 def main():
-    import copy
-    from CSP_solver import _total_assigned
-
     geometry_dir = ensure_geometry()
     cbf_json_path = ensure_cbf()
 
-    vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
-    original_cbf = copy.deepcopy(vessel.cbf)
-    # solve()会原地扣减vessel.cbf，留一份原始计划量给evaluate_pod_leverage分析杠杆结构用
+    # 初始化母本 Vessel
+    base_vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
+    original_cbf = copy.deepcopy(base_vessel.cbf)
 
-    snapshots = {}
-    best = {"assigned": -1, "vessel": None}
-    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, ci_enabled=CI_ENABLED)
-
-    if success:
-        result_vessel = vessel
-        print("\n──── Solution Found ────")
-    else:
-        result_vessel = best["vessel"]
-        print(
-            f"\n──── No Full Solution — 输出搜索过程中最优的近似解 ────\n"
-            f"求解卡在 current_pol={vessel.current_pol}, "
-            f"total_remaining={vessel.total_remaining()}"
-        )
-
-    if result_vessel is None:
-        print("连一个箱子都没能装上，没有可导出的近似解")
-        return
-
-    remaining_total = sum(
-        counts.get("GP", 0) + counts.get("RF", 0) + counts.get("HC", 0) + counts.get("HR", 0)
-        for pod_dict in result_vessel.cbf.values()
-        for counts in pod_dict.values()
-    )
-
-    if remaining_total > 0:
-        print("\n尾货cbf明细：")
-        for pol, pod_dict in sorted(result_vessel.cbf.items()):
-            for pod, counts in sorted(pod_dict.items()):
-                if counts.get("GP", 0) > 0 or counts.get("RF", 0) > 0 or counts.get("HC", 0) > 0 or counts.get("HR", 0) > 0:
-                    port_label = PORT_NAMES.get(pod, pod)
-                    print(f"    POL={pol} POD={port_label}: {counts}")
-
-    if snapshots:
-        ci_ceiling = evaluate_ci_theoretical_ceiling(vessel)
-        print(f"\n[理论CI上限] 基于船舱几何，CI_ideal = {ci_ceiling:.3f}")
-        evaluate_crane_intensity(vessel, snapshots, target_ci=TARGET_CI, port_names=PORT_NAMES)
-        evaluate_crane_time(vessel, snapshots, k=2, crane_rate=1.0, port_names=PORT_NAMES)
-    else:
-        print("\n[evaluate] 没有完整的逐港snapshots（求解失败且未走到任何一港完成），跳过CI评估")
-    # evaluate_pod_leverage(original_cbf)
-
-    paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_plot_phy=False)
-    print(f"Exported {len(paths)} bayplan files to {BAYPLAN_DIR}")
+    # 实验参数设置
+    seeds = [42, 54, 87, 100, 2026, 7, 999, 1234, 5555, 8888]
+    groups = {"CI_OFF": False, "CI_ON": True}
     
+    summary_data = []
+
+    print("\n================ 开始跑批测试 ================\n")
+
+    for group_name, ci_status in groups.items():
+        print(f"▶ 正在执行组别: {group_name} (ci_enabled={ci_status})")
+        
+        group_results = []
+        best_vessel_for_group = None
+        best_metric_for_group = float('inf') 
+        best_snapshots = None
+        
+        for seed in seeds:
+            random.seed(seed)
+            # 深拷贝确保每次搜索从初始状态开始
+            vessel = copy.deepcopy(base_vessel)
+            snapshots = {}
+            best = {"assigned": -1, "vessel": None}
+            
+            start_time = time.time()
+            success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, ci_enabled=ci_status)
+            exec_time = time.time() - start_time
+            
+            result_vessel = vessel if success else best["vessel"]
+            
+            if result_vessel is None:
+                print(f"  [Seed {seed:>4}] 失败: 连一个箱子都没能装上")
+                continue
+
+            # 计算尾货总数
+            tail_boxes = sum(
+                counts.get("GP", 0) + counts.get("RF", 0) + counts.get("HC", 0) + counts.get("HR", 0)
+                for pod_dict in result_vessel.cbf.values()
+                for counts in pod_dict.values()
+            )
+
+            total_voyage_time = 0.0
+            total_wait_time = 0.0
+            
+            if snapshots:
+                crane_res = evaluate_crane_time(result_vessel, snapshots, k=2, crane_rate=1.0,
+                                                 port_names=PORT_NAMES, if_debug=False)
+                total_voyage_time = sum(r["time_port"] for r in crane_res)
+                total_wait_time = sum(r["wait1"] + r.get("wait2", 0.0) for r in crane_res)
+
+            group_results.append({
+                "seed": seed,
+                "tail_boxes": tail_boxes,
+                "total_wait_time": total_wait_time,
+                "total_voyage_time": total_voyage_time,
+                "exec_time": exec_time
+            })
+            
+            print(f"  └─ 种子 {seed:>4}: 尾箱={tail_boxes:>3}, 阻塞耗时={total_wait_time:>5.1f}, 全程耗时={total_voyage_time:>5.1f}, 求解耗时={exec_time:.2f}s")
+            
+            # 记录本组最优解: 优先全程耗时短
+            sort_metric = total_voyage_time
+            if sort_metric < best_metric_for_group:
+                best_metric_for_group = sort_metric
+                best_vessel_for_group = copy.deepcopy(result_vessel)
+                best_snapshots = copy.deepcopy(snapshots)
+
+        # 统计本组均值和方差
+        if group_results:
+            tails = [r["tail_boxes"] for r in group_results]
+            waits = [r["total_wait_time"] for r in group_results]
+            voyages = [r["total_voyage_time"] for r in group_results]
+            
+            summary_data.append({
+                "Group": group_name,
+                "Tails (Mean/Var)": f"{np.mean(tails):.2f} / {np.var(tails):.2f}",
+                "Wait (Mean/Var)": f"{np.mean(waits):.1f} / {np.var(waits):.1f}",
+                "Voyage (Mean/Var)": f"{np.mean(voyages):.1f} / {np.var(voyages):.1f}"
+            })
+            print(f"  🏆 {group_name} 组最优: 尾箱={min(tails)}, 阻塞耗时={min(waits):.1f}, 全程耗时={min(voyages):.1f}")
+        print("-" * 60)
+
+    # 打印最终对比结果
+    print("\n================ 实验结果汇总 ================\n")
+    df_summary = pd.DataFrame(summary_data)
+    print(df_summary.to_string(index=False))
+
+    # 你可以在这里导出最优解的 bayplan:
+    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
 
 if __name__ == "__main__":
     main()
