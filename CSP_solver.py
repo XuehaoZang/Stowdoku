@@ -51,7 +51,7 @@ def mrv_select(choices: dict, vessel: Vessel):
     选格子阶段:
     1. 特殊箱判断       -->  优先看has_reefer的（当仍有Reefer需求时）  --> 剪枝：放完GP但是RF放不了
     2. 封舱判断         -->  优先看hold 或 已占用hold上deck           --> 剪枝：直接装完deck导致封舱
-    （待定3. 高箱判断         -->  优先看has_hicube的（当仍有HC需求时）      --> 剪枝：分配的位置放不进这么多高箱(TODO 需要进一步实现，并且修改投影规则+可视化等)）
+    （待定3. 高箱判断         -->  优先看has_hicube的（当仍有HC需求时）      --> 剪枝：分配的位置放不进这么多高箱(暂时不加高箱规则)）
     4. 候选集排序       -->  优先看候选可能最少的                      --> 剪枝：加快搜索
     5. 随机数打散
     返回 (bay, lr, hd)
@@ -67,39 +67,21 @@ def mrv_select(choices: dict, vessel: Vessel):
 
     return min(choices.items(), key=priority)[0]
 
-def _pod_try_order(cands, vessel, bay, lr, hd, if_match_HC=True):
+def _pod_try_order(cands, vessel, bay, lr, hd):
     """
     选箱子来填格子阶段：_pod_try_order
     1. 特殊箱匹配：哪个港口有reefer箱子，根据格子的冰箱容量进行匹配
-    2. 高箱匹配：(POD剩余需求里HC+HR占比)X(cell的capacity_hc占比)作为分数，量化了高箱需求和容量的匹配度。
-    3. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）（TODO CI评估函数部分需要继续推敲）
-    4. 箱重匹配（旨在让空箱上浮（甲板上堆高）重箱下沉（舱底））（TODO 未来实现）
-    5. 重量平衡（往这个bay放POD=?的箱子可以改善重量平衡？）（TODO 未来实现）
-    6. 按照POD rel_rank降序（先装目的地远的箱子 TODO 先远后近是好的策略吗）
+    2. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）（TODO CI评估函数部分需要继续推敲）
+    3. 箱重匹配（旨在让空箱上浮（甲板上堆高）重箱下沉（舱底））（TODO 未来实现）
+    4. 重量平衡（往这个bay放POD=?的箱子可以改善重量平衡？）（TODO 未来实现）
+    5. 按照POD rel_rank降序（先装目的地远的箱子 TODO 先远后近是好的策略吗）
     """
     current_cbf = vessel.cbf[vessel.current_pol]
     has_reefer_here = vessel.has_reefer[bay, lr, hd]
 
-    if not if_match_HC:
-        def key(pod):
-            rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
-            return (0 if rf_need else 1, pod)
-        return sorted(cands, key=key)
-
-    cap_total_here = vessel.capacity_total[bay, lr, hd]
-    cap_hc_here = vessel.capacity_hc[bay, lr, hd]
-    hc_capacity_ratio = (cap_hc_here / cap_total_here) if cap_total_here > 0 else 0.0
-
     def key(pod):
-        rf_need = has_reefer_here and (current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0)) > 0
-
-        demand = current_cbf[pod]
-        total_demand = sum(demand.get(k, 0) for k in ("GP", "HC", "RF", "HR"))
-        hc_demand_ratio = ((demand.get("HC", 0) + demand.get("HR", 0)) / total_demand
-                            if total_demand > 0 else 0.0)
-        hc_match_score = hc_demand_ratio * hc_capacity_ratio
-
-        return (0 if rf_need else 1, -hc_match_score, pod)
+        rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
+        return (0 if rf_need else 1, pod)
 
     return sorted(cands, key=key)
 
@@ -116,7 +98,7 @@ def _total_assigned(vessel: Vessel) -> int:
 
 _solve_call_count = [0]
 
-def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, if_match_HC=True) -> bool:
+def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
     """
     统一大递归：装载 + 换港，discharge作为递归中的特殊节点。
     vessel内部维护current_pol和cbf状态。
@@ -146,7 +128,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, if_match_HC
         discharged = vessel.discharge(vessel.current_pol)
         vessel.reset_port_bay_load(discharged)
 
-        if solve(vessel, is_debug, snapshots, best, if_match_HC):
+        if solve(vessel, is_debug, snapshots, best):
             return True
 
         # 下一港失败，回溯
@@ -167,13 +149,13 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, if_match_HC
     if not choices:
         # 所有空cell的cbf候选都已耗尽，等价于port_complete
         # 下一次递归开头的port_complete()会处理换港
-        return solve(vessel, is_debug, snapshots, best, if_match_HC)
+        return solve(vessel, is_debug, snapshots, best)
 
     # MRV选位置
     pos = mrv_select(choices, vessel)
     bay, lr, hd = pos
 
-    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd, if_match_HC):
+    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd):
         vessel.assign(bay, lr, hd, pod)
 
         current_total = _total_assigned(vessel)
@@ -181,7 +163,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, if_match_HC
             best["assigned"] = current_total
             best["vessel"] = copy.deepcopy(vessel)
 
-        if solve(vessel, is_debug, snapshots, best, if_match_HC):
+        if solve(vessel, is_debug, snapshots, best):
             return True
 
         vessel.unassign(bay, lr, hd, pod)

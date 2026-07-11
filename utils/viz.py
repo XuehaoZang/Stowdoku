@@ -144,8 +144,18 @@ def _render_bayplan(slots, title, filename, save_dir, port_colors, port_names=No
             rect = patches.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor=color, edgecolor="black", linewidth=0.5)
             ax.add_patch(rect)
 
-            if slot.can_reefer and slot.RF_count > 0:
-                ax.text(x, y, "R", ha="center", va="center", fontsize=6, color="black")
+            is_hc = bool(slot.is_hc)
+            is_rf = slot.can_reefer and slot.RF_count > 0
+            if is_hc and is_rf:
+                label = "HR"
+            elif is_hc:
+                label = "H"
+            elif is_rf:
+                label = "R"
+            else:
+                label = None
+            if label:
+                ax.text(x, y, label, ha="center", va="center", fontsize=6, color="black")
 
         ax.set_xlim(-0.6, n_rows_global - 0.4)
         ax.set_ylim(-0.6, n_tiers_global - 0.4)
@@ -176,7 +186,7 @@ def _render_bayplan(slots, title, filename, save_dir, port_colors, port_names=No
         for pod, color in port_colors.items()
     ]
     legend_handles.append(patches.Patch(color="#D9D9D9", label="20ft", ec="black", lw=0.5))
-    legend_handles.append(patches.Patch(facecolor="white", edgecolor="black", label="Reefer"))
+    # legend_handles.append(patches.Patch(facecolor="white", edgecolor="black", label="Reefer"))
     fig.legend(
         handles=legend_handles, loc="center left", bbox_to_anchor=(0.92, 0.5),
         title="POD & INFO", fontsize=8, frameon=True,
@@ -209,6 +219,8 @@ def plot_bayplan(slots, title="bayplan", filename="bayplan.png", save_dir=".",
         can_40ft=True 且 POD==-1（有效但本次未分配）        -> 白色
         can_40ft=True 且 POD!=-1                            -> port_colors[POD]
         can_reefer=True 且 该cell的RF_count>0               -> 叠加"R"标记
+        is_hc=True                                          -> 叠加"H"标记
+        （同时满足以上两条 -> 叠加"HR"标记）
 
     bay子图按_bay_grid_positions()算出的版面位置排布，对应真实配载图惯例
     （同一对pair的b0在上、b1在下，整体块顺序倒转，块内降序，Bay01排在末尾）。

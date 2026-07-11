@@ -360,13 +360,15 @@ class Vessel:
         capacity_rf = Vessel.build_vessel_cell(slots, "can_reefer_40ft")
         return is_valid, capacity_total, capacity_rf
 
-    def proj_cell_to_vessel(self, cell_state=None) -> pd.DataFrame:
+    def proj_cell_to_vessel(self, cell_state=None, original_cbf=None) -> pd.DataFrame:
         """
         cell级解 -> slot级DataFrame投影。
         cell_state: 不传则用当前self.cell；传则接受snapshot()格式的dict（取其"cell"）。
+        original_cbf: 航次开始前（solve()扣减之前）的原始cbf，用于按(POL,POD)读取
+                      HC/HR原始总demand，作为贴HC标签的预算池来源（见下）。
 
         返回列：bay_idx, row_idx, tier_idx, lr, hd, can_40ft, can_20ft, can_reefer,
-               POL, POD, GP_count, RF_count
+               POL, POD, GP_count, RF_count, is_hc
 
         分配到具体物理槽位的规则（cell级解 -> slot级的合理近似复原，
         不是真实精确到箱位的CSP解，只是按装载习惯把cell总量摊到槽位上，
@@ -376,9 +378,18 @@ class Vessel:
             2. 再摊GP需求：在这个cell剩下的所有槽位里（含没被RF用到的reefer槽位），
                按同样顺序摊满GP_count个槽位。
             3. 摊不满的槽位，POD保持-1。
+
+        第二步（贴HC标签）：预算池按(POL,POD)粒度，取original_cbf里这个POL/POD
+        的原始HC/HR总demand（不用record["_gp_from_hc"]/["_rf_from_hr"]——那两个
+        只是assign()记账顺序的副产品，只服务unassign()回滚，不代表这个cell该
+        负责发多少高箱名额）。同一个POD占用的所有cell共享同一个预算池，按cell的
+        capacity_hc降序依次分配；cell内部仍按摞（capacity_hc_stack降序、从下往上）
+        贴标。预算池最终分不完的部分，回退进cbf余量。
         """
         if self.full_slot_table is None:
             raise ValueError("此Vessel无full_slot_table，无法投影，需通过Vessel.load_vessel()构造")
+        if original_cbf is None:
+            raise ValueError("proj_cell_to_vessel需要original_cbf来确定HC/HR贴标预算池")
 
         cell = self.cell if cell_state is None else cell_state["cell"]
 
@@ -387,6 +398,9 @@ class Vessel:
         slots["POD"] = -1
         slots["GP_count"] = 0
         slots["RF_count"] = 0
+        slots["is_hc"] = False
+
+        cell_infos = []  # 供第二步HC贴标使用，按(POL,POD)分组
 
         for big_bay, (b0, b1) in enumerate(STSE_BAY_PAIRS):
             b0_can40 = (slots.bay_idx == b0) & slots.can_40ft
@@ -432,7 +446,31 @@ class Vessel:
                         slots.at[idx, "POD"] = pod
                         slots.at[idx, "GP_count"] = 1
 
-                    # b1侧：镜像写回，(row_idx,tier_idx)与b0侧完全一致
+                    # 摞 = 同一row_idx方向叠放的can_40ft槽位集合（与_derive_capacity_hc
+                    # 的分组口径一致），stack_hc = hold摞min(n,2) / deck摞n-1。
+                    row_groups = {}
+                    for idx in cell_idx:
+                        row_groups.setdefault(slots.at[idx, "row_idx"], []).append(idx)
+                    for row_idx, idx_list in row_groups.items():
+                        idx_list.sort(key=lambda idx: slots.at[idx, "tier_idx"])
+
+                    stack_hc_remaining = {
+                        row_idx: (min(len(idx_list), 2) if hd == 0 else max(len(idx_list) - 1, 0))
+                        for row_idx, idx_list in row_groups.items()
+                    }
+                    row_order = sorted(row_groups.keys(), key=lambda r: stack_hc_remaining[r], reverse=True)
+
+                    cell_infos.append({
+                        "pol": pol, "pod": pod, "b1": b1, "hd": hd,
+                        "cap_hc": int(self.capacity_hc[big_bay, lr, hd]),
+                        "row_groups": row_groups,
+                        "row_order": row_order,
+                        "stack_hc_remaining": stack_hc_remaining,
+                        "used_rf_set": set(used_rf_idx),
+                        "used_gp_set": set(used_gp_idx),
+                    })
+
+                    # b1侧：镜像写回GP/RF计数，(row_idx,tier_idx)与b0侧完全一致
                     used_idx = used_rf_idx + used_gp_idx
                     if not used_idx:
                         continue
@@ -451,10 +489,111 @@ class Vessel:
                             else:
                                 slots.at[idx, "GP_count"] = 1
 
-        return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
-                      "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count"]]
+        # 第二步：贴HC标签 + 降级回退，按(POL,POD)共享预算池，cell按capacity_hc降序分配。
+        pod_groups = {}
+        for info in cell_infos:
+            pod_groups.setdefault((info["pol"], info["pod"]), []).append(info)
 
-    def export_bayplan(self, snapshots: dict, out_dir: str, port_names: dict = None, if_plot_phy: bool = False) -> list:
+        for (pol, pod), infos in pod_groups.items():
+            demand = original_cbf.get(pol, {}).get(pod, {})
+            gp_hc_budget = demand.get("HC", 0)
+            rf_hc_budget = demand.get("HR", 0)
+
+            infos.sort(key=lambda info: info["cap_hc"], reverse=True)
+
+            for info in infos:
+                row_groups = info["row_groups"]
+                row_order = info["row_order"]
+                stack_hc_remaining = info["stack_hc_remaining"]
+                used_rf_set = info["used_rf_set"]
+                used_gp_set = info["used_gp_set"]
+                hc_tagged_idx = set()
+
+                for row_idx in row_order:
+                    if rf_hc_budget <= 0:
+                        break
+                    occupied_rf_in_stack = [idx for idx in row_groups[row_idx] if idx in used_rf_set]
+                    take = min(stack_hc_remaining[row_idx], len(occupied_rf_in_stack), rf_hc_budget)
+                    for idx in occupied_rf_in_stack[:take]:
+                        slots.at[idx, "is_hc"] = True
+                        hc_tagged_idx.add(idx)
+                    stack_hc_remaining[row_idx] -= take
+                    rf_hc_budget -= take
+
+                for row_idx in row_order:
+                    if gp_hc_budget <= 0:
+                        break
+                    occupied_gp_in_stack = [
+                        idx for idx in row_groups[row_idx]
+                        if idx in used_gp_set and idx not in hc_tagged_idx
+                    ]
+                    take = min(stack_hc_remaining[row_idx], len(occupied_gp_in_stack), gp_hc_budget)
+                    for idx in occupied_gp_in_stack[:take]:
+                        slots.at[idx, "is_hc"] = True
+                        hc_tagged_idx.add(idx)
+                    stack_hc_remaining[row_idx] -= take
+                    gp_hc_budget -= take
+
+                if not hc_tagged_idx:
+                    continue
+
+                # b1侧：镜像is_hc标签，(row_idx,tier_idx)与b0侧完全一致
+                b1 = info["b1"]
+                rt_hc = {
+                    (slots.at[idx, "row_idx"], slots.at[idx, "tier_idx"])
+                    for idx in hc_tagged_idx
+                }
+                for idx in slots.index[slots.bay_idx == b1]:
+                    key = (slots.at[idx, "row_idx"], slots.at[idx, "tier_idx"])
+                    if key in rt_hc:
+                        slots.at[idx, "is_hc"] = True
+
+                # deck摞的HC是阶跃式扣减：这一摞只要出现>=1个HC，总占用数就要
+                # 从n降到n-1（不管贴了几个HC），跟hold摞的纯配额min(n,2)不同。
+                # 如果这一摞贴标签前是摆满的(occupied==n)，就要把这一摞里
+                # tier_idx最大(最后摆放)的那个占用槽位腾空，对应的demand按GP
+                # 回退回cbf余量。
+                if info["hd"] == 1:
+                    used_rf_set = info["used_rf_set"]
+                    used_gp_set = info["used_gp_set"]
+                    idx_to_row = {idx: r for r, idxs in row_groups.items() for idx in idxs}
+                    rows_with_hc = {idx_to_row[idx] for idx in hc_tagged_idx}
+                    for row_idx in rows_with_hc:
+                        idxs = row_groups[row_idx]
+                        n = len(idxs)
+                        occupied = sum(1 for idx in idxs if idx in used_rf_set or idx in used_gp_set)
+                        if occupied != n:
+                            continue
+
+                        idx_release = idxs[-1]
+                        release_row = slots.at[idx_release, "row_idx"]
+                        release_tier = slots.at[idx_release, "tier_idx"]
+
+                        for target_idx in [idx_release] + list(slots.index[
+                            (slots.bay_idx == b1)
+                            & (slots.row_idx == release_row)
+                            & (slots.tier_idx == release_tier)
+                        ]):
+                            slots.at[target_idx, "POL"] = -1
+                            slots.at[target_idx, "POD"] = -1
+                            slots.at[target_idx, "GP_count"] = 0
+                            slots.at[target_idx, "RF_count"] = 0
+                            slots.at[target_idx, "is_hc"] = False
+
+                        cbf_demand = self.cbf[pol][pod]
+                        cbf_demand["GP"] = cbf_demand.get("GP", 0) + 1
+
+            if gp_hc_budget > 0 or rf_hc_budget > 0:
+                # 预算池分不完——把这部分HC/HR demand回退进cbf余量，
+                # 跟真正没找到地方放的尾货合并存放。
+                cbf_demand = self.cbf[pol][pod]
+                cbf_demand["HC"] = cbf_demand.get("HC", 0) + gp_hc_budget
+                cbf_demand["HR"] = cbf_demand.get("HR", 0) + rf_hc_budget
+
+        return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
+                      "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count", "is_hc"]]
+
+    def export_bayplan(self, snapshots: dict, out_dir: str, original_cbf: dict, port_names: dict = None, if_plot_phy: bool = False) -> list:
         """
         遍历snapshots（solve()产出的{POL: snapshot_dict}），对每个POL调用proj_cell_to_vessel，
         存成{POL}_{港口码}_DEP_bayplan.csv，同时调用utils.viz.plot_bayplan画一张png，
@@ -490,7 +629,7 @@ class Vessel:
 
         for pol in sorted(snapshots.keys()):
             code = port_names.get(pol, str(pol)) if port_names else str(pol)
-            df = self.proj_cell_to_vessel(cell_state=snapshots[pol])
+            df = self.proj_cell_to_vessel(cell_state=snapshots[pol], original_cbf=original_cbf)
 
             csv_path = os.path.join(out_dir, f"{pol}_{code}_DEP_bayplan.csv")
             df.to_csv(csv_path, index=False)
