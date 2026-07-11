@@ -31,7 +31,7 @@ def cal_candidates(vessel: Vessel) -> dict:
     return choices
 
 
-def _ci_cell_score(vessel: Vessel, bay: int, lr: int, hd: int) -> float:
+def _ci_current_pol_score(vessel: Vessel, bay: int, lr: int, hd: int) -> float:
     """
     cell层CI评分：只用cell固有属性(capacity_total)和聚合状态(current_port_bay_load)，
     不看实际分配的POD/demand数量。
@@ -61,6 +61,72 @@ def _ci_cell_score(vessel: Vessel, bay: int, lr: int, hd: int) -> float:
     return max(pair_costs)
 
 
+def _pod_total_demand(cbf_original: dict) -> dict:
+    """
+    箱子层CI打分的基础准备：按POD汇总全航次原始总需求(GP+HC+RF+HR)，
+    跨所有POL累加。只读cbf_original，不受assign/unassign过程影响。
+    返回 {pod: 总量}。
+    """
+    totals = {}
+    for pod_counts in cbf_original.values():
+        for pod, counts in pod_counts.items():
+            totals[pod] = totals.get(pod, 0) + sum(
+                counts.get(k, 0) for k in ("GP", "HC", "RF", "HR")
+            )
+    return totals
+
+
+def _pod_bay_footprint(vessel: Vessel) -> dict:
+    """
+    箱子层CI打分的基础准备：扫一遍vessel.cell，按POD分组统计每个bay已装的
+    GP_count+RF_count，产出{pod: np.ndarray(n_bay)}。未出现过的POD不预先补0，
+    调用方自己处理缺失key。
+    """
+    footprints = {}
+    for bay in range(vessel.n_bay):
+        for lr in range(2):
+            for hd in range(2):
+                rec = vessel.cell[bay, lr, hd]
+                pod = rec["POD"]
+                if pod == -1:
+                    continue
+                if pod not in footprints:
+                    footprints[pod] = np.zeros(vessel.n_bay, dtype=int)
+                footprints[pod][bay] += rec["GP_count"] + rec["RF_count"]
+    return footprints
+
+
+def _ci_future_pod_score(vessel: Vessel, bay: int, lr: int, hd: int, pod, footprint: dict, pod_total_demand: dict) -> float:
+    """
+    箱子层CI评分：给"往(bay,lr,hd)装POD=pod"这个选择打分，衡量对该POD自身
+    吊车负荷分布的影响，按该POD全航次总需求D_pod归一化（同样的绝对负荷，
+    对总需求小的POD影响更大）。
+    - Cost_adj: 邻居影响。假设把这个cell放到相邻bay对里，会不会把该POD的负荷进一步
+      堆到已经堆得高的相邻bay旁边（用相邻bay里该POD footprint的较大值衡量）。
+    - Cost_intra: 内部影响。该POD在本bay内（放了这个cell之后）是否超过本bay容量的一半
+      （超过半舱意味着这个bay要为这个POD单独作业一整趟吊车，intra-bay堆叠代价）。
+    D_pod<=0（这个POD根本没有总需求）时直接返回0，避免除零。
+    """
+    D_pod = pod_total_demand.get(pod, 0)
+    if D_pod <= 0:
+        return 0.0
+
+    fp = footprint.get(pod)
+    if fp is None:
+        fp = np.zeros(vessel.n_bay, dtype=int)
+
+    neighbor_max = max(
+        fp[bay - 1] if bay - 1 >= 0 else 0,
+        fp[bay + 1] if bay + 1 < vessel.n_bay else 0,
+    )
+    Cost_adj = neighbor_max / D_pod
+
+    Cap_bay = vessel.capacity_total[bay].sum()
+    Cost_intra = max(0, fp[bay] + vessel.capacity_total[bay, lr, hd] - Cap_bay / 2) / D_pod
+
+    return Cost_adj + Cost_intra
+
+
 def mrv_select(choices: dict, vessel: Vessel, ci_enabled=True):
     """
     原始数独的方式是根据现在已知方格的信息确定其余方格的约束信息，从候选集最少的方格开始尝试，这里主要考虑在多种约束情况下设计剪枝规则
@@ -80,26 +146,39 @@ def mrv_select(choices: dict, vessel: Vessel, ci_enabled=True):
             current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0 for pod in cands
         )
         is_dead_slot = hd == 1 and vessel.cell[bay, lr, 0]["POD"] == -1
-        ci_score = _ci_cell_score(vessel, bay, lr, hd) if ci_enabled else 0
+        ci_score = _ci_current_pol_score(vessel, bay, lr, hd) if ci_enabled else 0
         return (0 if has_rf_need else 1, 0 if not is_dead_slot else 1, ci_score, len(cands), random.random())
 
     return min(choices.items(), key=priority)[0]
 
-def _pod_try_order(cands, vessel, bay, lr, hd):
+def _pod_try_order(cands, vessel, bay, lr, hd, pod_ci_enabled=True):
     """
     选箱子来填格子阶段：_pod_try_order
     1. 特殊箱匹配：哪个港口有reefer箱子，根据格子的冰箱容量进行匹配
-    2. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）（TODO CI评估函数部分需要继续推敲）
+    2. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）(pod_ci_enabled控制)
     3. 箱重匹配（旨在让空箱上浮（甲板上堆高）重箱下沉（舱底））（TODO 未来实现）
     4. 重量平衡（往这个bay放POD=?的箱子可以改善重量平衡？）（TODO 未来实现）
     5. 按照POD rel_rank降序（先装目的地远的箱子 TODO 先远后近是好的策略吗）
+    pod_ci_enabled=False时用于消融实验，退回历史基线排序(rf_need, pod)，
+    不计算_ci_future_pod_score/rel_rank。
     """
     current_cbf = vessel.cbf[vessel.current_pol]
     has_reefer_here = vessel.has_reefer[bay, lr, hd]
 
+    if not pod_ci_enabled:
+        def key(pod):
+            rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
+            return (0 if rf_need else 1, pod)
+
+        return sorted(cands, key=key)
+
+    footprint = _pod_bay_footprint(vessel)
+    pod_total_demand = _pod_total_demand(vessel.cbf_original)
+
     def key(pod):
         rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
-        return (0 if rf_need else 1, pod)
+        ci_score = _ci_future_pod_score(vessel, bay, lr, hd, pod, footprint, pod_total_demand)
+        return (0 if rf_need else 1, ci_score, -vessel.rel_rank(pod), pod)
 
     return sorted(cands, key=key)
 
@@ -116,13 +195,14 @@ def _total_assigned(vessel: Vessel) -> int:
 
 _solve_call_count = [0]
 
-def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=True) -> bool:
+def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=True, pod_ci_enabled=True) -> bool:
     """
     统一大递归：装载 + 换港，discharge作为递归中的特殊节点。
     vessel内部维护current_pol和cbf状态。
     best: dict容器 {"assigned": int, "vessel": Vessel或None}，
           记录搜索过程中见过的、已装箱数最多的状态快照，用于失败时输出最优近似解。
     ci_enabled: 传给mrv_select，控制是否启用CI cell层评分，供消融实验用。
+    pod_ci_enabled: 传给_pod_try_order，控制是否启用箱子层CI评分，供消融实验用。
     CI的事后评估交给utils.evaluate.evaluate_crane_intensity（基于solve()跑完后的
     snapshots算，跨港口口径统一），不在这里自己攒诊断数据。
     """
@@ -149,7 +229,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=
         discharged = vessel.discharge(vessel.current_pol)
         vessel.reset_port_bay_load(discharged)
 
-        if solve(vessel, is_debug, snapshots, best, ci_enabled):
+        if solve(vessel, is_debug, snapshots, best, ci_enabled, pod_ci_enabled):
             return True
 
         # 下一港失败，回溯
@@ -170,13 +250,13 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=
     if not choices:
         # 所有空cell的cbf候选都已耗尽，等价于port_complete
         # 下一次递归开头的port_complete()会处理换港
-        return solve(vessel, is_debug, snapshots, best, ci_enabled)
+        return solve(vessel, is_debug, snapshots, best, ci_enabled, pod_ci_enabled)
 
     # MRV选位置
     pos = mrv_select(choices, vessel, ci_enabled)
     bay, lr, hd = pos
 
-    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd):
+    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd, pod_ci_enabled):
         vessel.assign(bay, lr, hd, pod)
 
         current_total = _total_assigned(vessel)
@@ -184,7 +264,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=
             best["assigned"] = current_total
             best["vessel"] = copy.deepcopy(vessel)
 
-        if solve(vessel, is_debug, snapshots, best, ci_enabled):
+        if solve(vessel, is_debug, snapshots, best, ci_enabled, pod_ci_enabled):
             return True
 
         vessel.unassign(bay, lr, hd, pod)
@@ -255,9 +335,70 @@ if __name__ == "__main__":
     vessel = Vessel(full_slot_table=full_slot_table, cbf=cbf, current_pol=0)
     vessel_init = copy.deepcopy(vessel)
 
+    # ──────────────────────────────────────────────────────────────
+    # rel_rank提升为公开方法的冒烟测：
+    # 1. 手工按原公式心算几个POD的rel_rank，跟vessel.rel_rank(pod)比对
+    # 2. 用重构前的原始闭包逻辑复刻一份_get_candidates_reference，跟
+    #    重构后的vessel.get_candidates逐cell比对，验证候选集完全一致
+    # ──────────────────────────────────────────────────────────────
+    print("──── rel_rank重构 冒烟测 ────")
+
+    def _manual_rel_rank(v, pod):
+        c = (v.current_pol - v.port_min) % v.n_ports
+        p = (pod - v.port_min) % v.n_ports
+        return (p - c) if p >= c else (p - c + v.n_ports)
+
+    for pod in (1, 2, 3):
+        manual = _manual_rel_rank(vessel_init, pod)
+        actual = vessel_init.rel_rank(pod)
+        assert manual == actual, f"[FAILED] rel_rank(pod={pod}): 手算={manual}, 实际={actual}"
+        print(f"  [OK] rel_rank(pod={pod}) 手算={manual} == vessel.rel_rank={actual}")
+
+    def _get_candidates_reference(v, bay, lr, hd):
+        """原重构前的get_candidates逻辑，rel_rank用局部闭包内联复刻。"""
+        if not v.is_valid[bay, lr, hd]:
+            return set()
+        current_cbf = v.cbf[v.current_pol]
+        other_hd = 1 - hd
+        other_pod = v.cell[bay, lr, other_hd]["POD"]
+        if hd == 0 and other_pod != -1:
+            return set()
+
+        def rel_rank(pod):
+            c = (v.current_pol - v.port_min) % v.n_ports
+            p = (pod - v.port_min) % v.n_ports
+            return (p - c) if p >= c else (p - c + v.n_ports)
+
+        other_rank = rel_rank(other_pod) if other_pod != -1 else None
+        candidates = set()
+        for pod, counts in current_cbf.items():
+            if other_rank is not None:
+                new_rank = rel_rank(pod)
+                if new_rank > other_rank:
+                    continue
+            has_gp_demand = (counts.get("GP", 0) + counts.get("HC", 0)) > v.tail_threshold
+            has_rf_demand = v.has_reefer[bay, lr, hd] and (counts.get("RF", 0) + counts.get("HR", 0)) > 0
+            if has_gp_demand or has_rf_demand:
+                candidates.add(pod)
+        return candidates
+
+    def _check_candidates_match(v, label):
+        mismatches = []
+        for bay in range(v.n_bay):
+            for lr in range(2):
+                for hd in range(2):
+                    expected = _get_candidates_reference(v, bay, lr, hd)
+                    actual = v.get_candidates(bay, lr, hd)
+                    if expected != actual:
+                        mismatches.append((bay, lr, hd, expected, actual))
+        assert not mismatches, f"[FAILED] {label} 候选集不一致: {mismatches}"
+        print(f"  [OK] {label}: 全部(bay,lr,hd)候选集与重构前逻辑完全一致")
+
+    _check_candidates_match(vessel_init, "重构前状态(current_pol=0，未assign任何货)")
+
     snapshots = {}
     best = {"assigned": -1, "vessel": None}
-    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, pod_ci_enabled=True)
 
     if success:
         print("\n──── Solution Found ────")
@@ -265,6 +406,16 @@ if __name__ == "__main__":
     else:
         print("\n──── No Full Solution — 输出搜索过程中最优的近似解 ────")
         result_vessel = best["vessel"]
+
+    if snapshots:
+        # result_vessel在完全成功时current_pol已推进到cbf.keys()之外（终止态），
+        # 不是get_candidates的合法调用场景（原逻辑同样无法处理）；
+        # 改用snapshots里最后一个港口的departure快照——current_pol仍是合法值、
+        # 且已有部分cell被assign，是验证"重构后仍有效"的更有意义的中间状态。
+        last_port = max(snapshots.keys())
+        mid_vessel = copy.deepcopy(vessel_init)
+        mid_vessel.restore(snapshots[last_port])
+        _check_candidates_match(mid_vessel, f"重构后POL={last_port}的departure快照(部分cell已assign)")
 
     if result_vessel is not None:
         print(f"共装箱数: {_total_assigned(result_vessel)}")
@@ -275,5 +426,107 @@ if __name__ == "__main__":
                     print(f"    POL={pol} POD={pod}: {counts}")
         print("[final state]")
         print_vessel(result_vessel)
+
+        print("\n──── 阶段0+1 冒烟测 ────")
+        print(f"vessel_init.cbf == result_vessel.cbf_original: "
+              f"{vessel_init.cbf == result_vessel.cbf_original}")
+        print(f"vessel_init.cbf        = {vessel_init.cbf}")
+        print(f"result_vessel.cbf_original = {result_vessel.cbf_original}")
+
+        total_demand = _pod_total_demand(result_vessel.cbf_original)
+        print(f"\n_pod_total_demand = {total_demand}")
+
+        footprint = _pod_bay_footprint(result_vessel)
+        print(f"\n_pod_bay_footprint = {footprint}")
+
+        print("\n手动核对（挑几个已赋值cell核对footprint）：")
+        checked = 0
+        for bay in range(result_vessel.n_bay):
+            if checked >= 3:
+                break
+            for lr in range(2):
+                for hd in range(2):
+                    rec = result_vessel.cell[bay, lr, hd]
+                    if rec["POD"] == -1 or checked >= 3:
+                        continue
+                    pod = rec["POD"]
+                    cell_load = rec["GP_count"] + rec["RF_count"]
+                    print(f"  cell(bay={bay}, lr={lr}, hd={hd}): POD={pod}, "
+                          f"GP_count={rec['GP_count']}, RF_count={rec['RF_count']} "
+                          f"(合计{cell_load}) -> footprint[{pod}][{bay}]={footprint[pod][bay]}")
+                    checked += 1
+        print("结论：以上每条cell记录的GP_count+RF_count都应 <= footprint[pod][bay]"
+              "（同一(pod,bay)可能有多个lr/hd cell的贡献被累加在一起）。")
     else:
         print("连一个箱子都没能装上")
+
+    # ──────────────────────────────────────────────────────────────
+    # 阶段2冒烟测：_ci_future_pod_score 独立验证，全部用手工构造的假
+    # footprint/pod_total_demand，不依赖上面solve()的真实结果。
+    # 复用vessel_init的静态几何（capacity_total等），n_bay=7，
+    # 各大bay容量：bay0=3, bay1=4, bay2=4, bay3=3, bay4~6=0
+    # ──────────────────────────────────────────────────────────────
+    print("\n──── 阶段2 smoke test: _ci_future_pod_score ────")
+
+    def _check(name, cond, expected, actual):
+        if not cond:
+            raise AssertionError(
+                f"[FAILED] 场景: {name} | 期望: {expected} | 实际: {actual}"
+            )
+        print(f"  [OK] {name} | 实际: {actual}")
+
+    v = vessel_init
+    fake_pod = 99
+    D_pod = 100
+
+    # 场景1：孤立空bay放第一箱——bay=1（邻居bay0/bay2），自己和邻居footprint都是0
+    footprint_1 = {}  # fake_pod没有任何footprint记录 -> 视为全0数组
+    score_1 = _ci_future_pod_score(v, bay=1, lr=0, hd=0, pod=fake_pod,
+                             footprint=footprint_1, pod_total_demand={fake_pod: D_pod})
+    _check("场景1 孤立空bay: Cost_adj+Cost_intra == 0",
+           score_1 == 0.0, "0.0", score_1)
+
+    # 场景2：邻居堆高——bay0的footprint设成接近D_pod一半(90)，bay=1去看邻居
+    footprint_2 = {fake_pod: np.zeros(v.n_bay, dtype=int)}
+    footprint_2[fake_pod][0] = 90
+    score_2 = _ci_future_pod_score(v, bay=1, lr=0, hd=0, pod=fake_pod,
+                             footprint=footprint_2, pod_total_demand={fake_pod: D_pod})
+    _check("场景2 邻居堆高: score > 0", score_2 > 0.0, "> 0", score_2)
+
+    # 场景3：半舱临界——bay=1, Cap_bay=4, 半舱=2, capacity_total[1,0,0]=1
+    # 先把fp[bay]设到刚好差1个cell顶格(2-1=1)，Cost_intra应为0
+    Cap_bay1 = v.capacity_total[1].sum()  # 4
+    cell_cap = v.capacity_total[1, 0, 0]  # 1
+    fp_at_edge = Cap_bay1 / 2 - cell_cap  # 1
+    footprint_3a = {fake_pod: np.zeros(v.n_bay, dtype=int)}
+    footprint_3a[fake_pod][1] = int(fp_at_edge)
+    score_3a = _ci_future_pod_score(v, bay=1, lr=0, hd=0, pod=fake_pod,
+                              footprint=footprint_3a, pod_total_demand={fake_pod: D_pod})
+    cost_intra_3a = score_3a  # bay0/bay2邻居fp都是0，Cost_adj=0，score即Cost_intra
+    _check("场景3a 半舱临界(差1个cell顶格): Cost_intra == 0",
+           cost_intra_3a == 0.0, "0.0", cost_intra_3a)
+
+    # 再加大1单位footprint，刚好顶格，Cost_intra应变正
+    footprint_3b = {fake_pod: np.zeros(v.n_bay, dtype=int)}
+    footprint_3b[fake_pod][1] = int(fp_at_edge) + 1
+    score_3b = _ci_future_pod_score(v, bay=1, lr=0, hd=0, pod=fake_pod,
+                              footprint=footprint_3b, pod_total_demand={fake_pod: D_pod})
+    _check("场景3b 半舱临界+1: Cost_intra > 0",
+           score_3b > 0.0, "> 0", score_3b)
+
+    # 场景4：归一化对比——完全相同的footprint/bay条件，只换D_pod（12 vs 300）
+    # 断言D_pod更小的分数更高：Cost_adj=neighbor_max/D_pod，
+    # neighbor_max固定不变时D_pod越小分母越小、分数越大——
+    # 这符合公式本身的方向（同样绝对负荷，对总需求小的POD影响更大），如实报告。
+    footprint_4 = {fake_pod: np.zeros(v.n_bay, dtype=int)}
+    footprint_4[fake_pod][0] = 90  # 邻居堆高，固定绝对负荷
+    score_small_D = _ci_future_pod_score(v, bay=1, lr=0, hd=0, pod=fake_pod,
+                                   footprint=footprint_4, pod_total_demand={fake_pod: 12})
+    score_large_D = _ci_future_pod_score(v, bay=1, lr=0, hd=0, pod=fake_pod,
+                                   footprint=footprint_4, pod_total_demand={fake_pod: 300})
+    _check("场景4 归一化: D_pod=12的分数 > D_pod=300的分数（公式方向如实断言）",
+           score_small_D > score_large_D,
+           f"score(D=12) > score(D=300)",
+           f"score(D=12)={score_small_D}, score(D=300)={score_large_D}")
+
+    print("阶段2 smoke test all passed")

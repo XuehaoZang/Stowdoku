@@ -87,7 +87,11 @@ class Vessel:
         self.cbf = cbf
         # 全航次cbf，格式：{POL: {POD: {"GP": count, "RF": count}}}
         # 内部通过current_pol指针取当前港口的切片，不在换港时替换整个dict
-        
+
+        self.cbf_original = copy.deepcopy(cbf)
+        # 航次开始前的原始需求快照，只读；assign/unassign只会修改self.cbf，
+        # 不会碰这份拷贝，专供后续箱子层CI打分计算各POD总需求用
+
         all_ports = set(self.cbf.keys())
         for pod_counts in self.cbf.values():
             all_ports.update(pod_counts.keys())
@@ -173,6 +177,12 @@ class Vessel:
         
     # ── 查询方法 ───────────────────────────────────────────────────────
 
+    def rel_rank(self, pod):
+        """相对current_pol的挂靠距离，允许绕圈（用port_min把港口范围平移到0起点）。"""
+        c = (self.current_pol - self.port_min) % self.n_ports
+        p = (pod - self.port_min) % self.n_ports
+        return (p - c) if p >= c else (p - c + self.n_ports)
+
     def get_candidates(self, bay, lr, hd) -> set:
         """
         返回候选POD集合（不再区分type——一个POD候选意味着这个cell可以同时
@@ -197,20 +207,14 @@ class Vessel:
         if hd == 0 and other_pod != -1:
             return set()
 
-        def rel_rank(pod):
-            """相对current_pol的挂靠距离，允许绕圈（用port_min把港口范围平移到0起点）。"""
-            c = (self.current_pol - self.port_min) % self.n_ports
-            p = (pod - self.port_min) % self.n_ports
-            return (p - c) if p >= c else (p - c + self.n_ports)
-
         # 走到这里，要么other_pod==-1，要么hd==1且hold已有货——
         # 此时deck候选必须比hold的货早卸（距离更小）
-        other_rank = rel_rank(other_pod) if other_pod != -1 else None
+        other_rank = self.rel_rank(other_pod) if other_pod != -1 else None
 
         candidates = set()
         for pod, counts in current_cbf.items():
             if other_rank is not None:
-                new_rank = rel_rank(pod)
+                new_rank = self.rel_rank(pod)
                 if new_rank > other_rank:
                     continue
             has_gp_demand = (counts.get("GP", 0) + counts.get("HC", 0)) > self.tail_threshold

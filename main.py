@@ -76,7 +76,7 @@ def main():
     original_cbf = copy.deepcopy(base_vessel.cbf)
 
     # 实验参数设置
-    seeds = [42, 54, 87, 100, 2026, 7, 999, 1234, 5555, 8888]
+    seeds = [42, 54, 87, 100, 35, 7, 49, 23, 66, 88]
     groups = {"CI_OFF": False, "CI_ON": True}
     
     summary_data = []
@@ -85,30 +85,27 @@ def main():
 
     for group_name, ci_status in groups.items():
         print(f"▶ 正在执行组别: {group_name} (ci_enabled={ci_status})")
-        
+
         group_results = []
-        best_vessel_for_group = None
-        best_metric_for_group = float('inf') 
+        best_record_for_group = None   # 存整条记录，不再分列各自求min
+        best_vessel_for_group = None      # 存对象，用于导出bayplan
         best_snapshots = None
-        
+
         for seed in seeds:
             random.seed(seed)
-            # 深拷贝确保每次搜索从初始状态开始
             vessel = copy.deepcopy(base_vessel)
             snapshots = {}
             best = {"assigned": -1, "vessel": None}
-            
+
             start_time = time.time()
             success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, ci_enabled=ci_status)
             exec_time = time.time() - start_time
-            
+
             result_vessel = vessel if success else best["vessel"]
-            
             if result_vessel is None:
                 print(f"  [Seed {seed:>4}] 失败: 连一个箱子都没能装上")
                 continue
 
-            # 计算尾货总数
             tail_boxes = sum(
                 counts.get("GP", 0) + counts.get("RF", 0) + counts.get("HC", 0) + counts.get("HR", 0)
                 for pod_dict in result_vessel.cbf.values()
@@ -117,43 +114,56 @@ def main():
 
             total_voyage_time = 0.0
             total_wait_time = 0.0
-            
+            voyage_utilization = None
+
             if snapshots:
                 crane_res = evaluate_crane_time(result_vessel, snapshots, k=2, crane_rate=1.0,
-                                                 port_names=PORT_NAMES, if_debug=False)
+                                                port_names=PORT_NAMES, if_debug=False)
                 total_voyage_time = sum(r["time_port"] for r in crane_res)
                 total_wait_time = sum(r["wait1"] + r.get("wait2", 0.0) for r in crane_res)
+                total_work = sum(r["work1"] + r["work2"] for r in crane_res)
+                total_capacity = sum(2 * r["time_port"] for r in crane_res)
+                voyage_utilization = total_work / total_capacity if total_capacity > 0 else None
 
-            group_results.append({
+            record = {
                 "seed": seed,
                 "tail_boxes": tail_boxes,
                 "total_wait_time": total_wait_time,
                 "total_voyage_time": total_voyage_time,
-                "exec_time": exec_time
-            })
-            
-            print(f"  └─ 种子 {seed:>4}: 尾箱={tail_boxes:>3}, 阻塞耗时={total_wait_time:>5.1f}, 全程耗时={total_voyage_time:>5.1f}, 求解耗时={exec_time:.2f}s")
-            
-            # 记录本组最优解: 优先全程耗时短
-            sort_metric = total_voyage_time
-            if sort_metric < best_metric_for_group:
-                best_metric_for_group = sort_metric
+                "voyage_utilization": voyage_utilization,
+                "exec_time": exec_time,
+            }
+            group_results.append(record)
+
+            util_str = f"{voyage_utilization:.3f}" if voyage_utilization is not None else "N/A"
+            print(f"  └─ 种子 {seed:>4}: 尾箱={tail_boxes:>3}, 阻塞耗时={total_wait_time:>5.1f}, "
+                f"全程耗时={total_voyage_time:>5.1f}, 利用率={util_str}, 求解耗时={exec_time:.2f}s")
+
+            # 组最优：按全程耗时挑出"同一次运行"的完整记录，不再分列各自取min
+            if best_record_for_group is None or total_voyage_time < best_record_for_group["total_voyage_time"]:
+                best_record_for_group = record
                 best_vessel_for_group = copy.deepcopy(result_vessel)
                 best_snapshots = copy.deepcopy(snapshots)
 
-        # 统计本组均值和方差
         if group_results:
             tails = [r["tail_boxes"] for r in group_results]
             waits = [r["total_wait_time"] for r in group_results]
             voyages = [r["total_voyage_time"] for r in group_results]
-            
+            utils = [r["voyage_utilization"] for r in group_results if r["voyage_utilization"] is not None]
+
             summary_data.append({
                 "Group": group_name,
                 "Tails (Mean/Var)": f"{np.mean(tails):.2f} / {np.var(tails):.2f}",
                 "Wait (Mean/Var)": f"{np.mean(waits):.1f} / {np.var(waits):.1f}",
-                "Voyage (Mean/Var)": f"{np.mean(voyages):.1f} / {np.var(voyages):.1f}"
+                "Voyage (Mean/Var)": f"{np.mean(voyages):.1f} / {np.var(voyages):.1f}",
+                "Utilization (Mean/Var)": f"{np.mean(utils):.3f} / {np.var(utils):.3f}" if utils else "N/A",
             })
-            print(f"  🏆 {group_name} 组最优: 尾箱={min(tails)}, 阻塞耗时={min(waits):.1f}, 全程耗时={min(voyages):.1f}")
+
+            b = best_record_for_group
+            print(f"  🏆 {group_name} 组最优(种子{b['seed']}): "
+                f"尾箱={b['tail_boxes']}, 阻塞耗时={b['total_wait_time']:.1f}, "
+                f"全程耗时={b['total_voyage_time']:.1f}, "
+                f"利用率={b['voyage_utilization']:.3f}" if b['voyage_utilization'] is not None else "N/A")
         print("-" * 60)
 
     # 打印最终对比结果
@@ -162,7 +172,7 @@ def main():
     print(df_summary.to_string(index=False))
 
     # 你可以在这里导出最优解的 bayplan:
-    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
+    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=True)
 
 if __name__ == "__main__":
     main()

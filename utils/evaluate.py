@@ -131,6 +131,10 @@ def _two_crane_port_schedule(bay_total: np.ndarray, crane_rate: float = 1.0) -> 
     取makespan最小的切分点，其makespan即这港的Time_port。
 
     n_bay<2时没有"两台吊车分工"的意义，全部量算在crane1头上。
+    
+    utilization: (work1+work2) / (2*makespan) —— 两台吊车在这港实际占用的
+    总时长(2*makespan，每台都经历了makespan这么久，不管是在干活还是在等)里，
+    有多大比例真正花在搬箱子上(work1+work2)。
     """
     time = np.asarray(bay_total, dtype=float) / crane_rate
     n_bay = len(time)
@@ -155,8 +159,10 @@ def _two_crane_port_schedule(bay_total: np.ndarray, crane_rate: float = 1.0) -> 
 
         makespan = max(time1, time2)
         if best is None or makespan < best["makespan"]:
+            utilization = (work1 + work2) / (2 * makespan) if makespan > 0 else None
             best = {"split": i, "work1": work1, "wait1": wait1, "time1": time1,
-                    "work2": work2, "wait2": 0.0, "time2": time2, "makespan": makespan}
+                    "work2": work2, "wait2": 0.0, "time2": time2, "makespan": makespan,
+                    "utilization": utilization}
 
     return best
 
@@ -233,6 +239,9 @@ def evaluate_crane_time(vessel: Vessel, snapshots: dict, k: int = 2, crane_rate:
     只有crane1可能非0——这是"都按bay升序处理"的顺序假设下的直接推论，不做
     对称化)、这一港总耗时(Time_port=makespan)，以及最后的Total_voyage_time；
     批量跑消融实验时可以传if_debug=False只取返回值、不刷屏。
+    
+    每港结果新增utilization，按work工时加权：
+    voyage_utilization = sum(work1+work2 各港) / sum(2*Time_port 各港)。
     """
     if k != 2:
         raise NotImplementedError("evaluate_crane_time目前只实现k=2的排班逻辑")
@@ -248,14 +257,21 @@ def evaluate_crane_time(vessel: Vessel, snapshots: dict, k: int = 2, crane_rate:
         results.append({**r, **sched, "time_port": time_port})
 
         if if_debug:
+            util_str = f"{sched['utilization']:.3f}" if sched["utilization"] is not None else "N/A"
             print(f"  POL={r['pol']}({r['label']}): 切分点={sched['split']}  "
                   f"吊车1[作业={sched['work1']:.1f} 阻塞={sched['wait1']:.1f}]  "
                   f"吊车2[作业={sched['work2']:.1f} 阻塞={sched['wait2']:.1f}]  "
-                  f"Time_port={time_port:.1f}")
+                  f"Time_port={time_port:.1f}  利用率={util_str}")
 
     total_voyage_time = sum(r["time_port"] for r in results)
+    total_work = sum(r["work1"] + r["work2"] for r in results)
+    total_capacity = sum(2 * r["time_port"] for r in results)
+    voyage_utilization = total_work / total_capacity if total_capacity > 0 else None
+
     if if_debug:
-        print(f"\n  Total_voyage_time(全程总时间) = {total_voyage_time:.1f}")
+        util_str = f"{voyage_utilization:.3f}" if voyage_utilization is not None else "N/A"
+        print(f"\n  Total_voyage_time(全程总时间) = {total_voyage_time:.1f}"
+              f"  全航次利用率(work工时加权) = {util_str}")
 
     return results
 
