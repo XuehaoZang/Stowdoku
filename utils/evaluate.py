@@ -13,6 +13,7 @@ utils/evaluate.py - 配载方案评估工具集
 目前已有：
 - evaluate_crane_intensity:      吊车负荷强度(CI)评估
 - evaluate_ci_theoretical_ceiling: 给定船体bay容量分布的理论CI上限
+- evaluate_crane_time:           k=2吊车排班下的实际作业耗时(Time_port/Total_voyage_time)评估
 - evaluate_pod_leverage:         POD杠杆(demand leverage)分析
 
 后续预留（还没实现，先占位注释，方便按同样的命名习惯继续加）：
@@ -66,27 +67,22 @@ def _port_sequence(port: int, port_min: int, n_ports: int) -> int:
     return (port - port_min) % n_ports
 
 
-# ── 对外评估函数 ─────────────────────────────────────────────────────
-
-def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, target_ci: float = 2,
-                              port_names: dict = None) -> list:
+def _port_bay_totals(vessel: Vessel, snapshots: dict, port_names: dict = None) -> list:
     """
-    对solve()跑出来的snapshots逐港口计算实际CI值，打印一张表并返回明细。
+    按航次顺序，对每港算出discharge_tally/loading_tally/bay_total(按bay)。
+    evaluate_crane_intensity和evaluate_crane_time共用这份计算，不用各自重新扫
+    一遍snapshots。
 
     discharge_tally: 到达port X时船上POD==X的箱量(按bay)
                       = 紧邻X之前的那个departure快照里POD==X的记录
                       （航次起点没有"到达"这个动作，记为全0，是合理的边界情况）
     loading_tally:    port X自己departure快照里POL==X的记录(按bay)
-    两者相加得到这一港每个bay的作业量，CI = 总量 / 最挤的相邻bay对之和。
 
-    target_ci是参考基准，不是硬约束——按目前拿到的运营经验，
-    总作业量500以内目标CI在3.5左右（对应n_bay=7下完全均匀分布的理论值），
-    不同总量级别下这个目标可能要相应调整，这里先留一个可传参的默认值，
-    不同吨位/箱量的港口不一定该用同一个数字比较。
+    返回按POL升序的list[dict]：{"pol","label","discharge_tally","loading_tally","bay_total"}。
     """
     pols_in_order = sorted(snapshots.keys())
     prev_snap = None
-    results = []
+    out = []
 
     for pol in pols_in_order:
         snap = snapshots[pol]
@@ -106,15 +102,85 @@ def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, target_ci: float =
         )
 
         bay_total = discharge_tally + loading_tally
-        ci = _ci_from_bay_totals(bay_total)
-
         label = port_names.get(pol, pol) if port_names else pol
-        results.append({
+        out.append({
             "pol": pol, "label": label,
             "discharge_tally": discharge_tally, "loading_tally": loading_tally,
-            "bay_total": bay_total, "ci": ci,
+            "bay_total": bay_total,
         })
         prev_snap = snap
+
+    return out
+
+
+def _two_crane_port_schedule(bay_total: np.ndarray, crane_rate: float = 1.0) -> dict:
+    """
+    单港k=2排班：crane1拿[0..i]、crane2拿[i+1..n_bay-1]，两台都按bay升序顺序
+    作业。边界(bay_i, bay_{i+1})相邻，物理上不能被两台吊车同时占用——crane2
+    永远t=0就先手拿下bay_{i+1}，所以只有crane1可能要在赶到bay_i时等crane2让出
+    边界；这是"都按bay升序处理"这个顺序假设下的直接推论，不做对称化处理。
+
+    对每个切分点i(0<=i<n_bay-1)：
+        S1 = sum(load[0..i-1])                     crane1顺序干完前面, 到达bay_i的时刻
+        boundary = load[i+1]                        crane2占着bay_{i+1}到这个时刻才让开
+        work1 = S1 + load[i]                        crane1实际作业耗时(不含等待)
+        wait1 = max(0, boundary - S1)                crane1的等待(阻塞)时长
+        time1 = work1 + wait1 = max(S1, boundary) + load[i]    crane1完工时刻
+        work2 = time2 = sum(load[i+1:])              crane2无需等待，正常完工
+        makespan(i) = max(time1, time2)
+    取makespan最小的切分点，其makespan即这港的Time_port。
+
+    n_bay<2时没有"两台吊车分工"的意义，全部量算在crane1头上。
+    """
+    time = np.asarray(bay_total, dtype=float) / crane_rate
+    n_bay = len(time)
+
+    if n_bay < 2:
+        total = float(time.sum())
+        return {"split": None, "work1": total, "wait1": 0.0, "time1": total,
+                "work2": 0.0, "wait2": 0.0, "time2": 0.0, "makespan": total}
+
+    prefix = np.concatenate(([0.0], np.cumsum(time)))  # prefix[i] = sum(time[0:i])
+    total_time = float(time.sum())
+
+    best = None
+    for i in range(n_bay - 1):
+        S1 = prefix[i]
+        boundary = time[i + 1]
+        work1 = S1 + time[i]
+        wait1 = max(0.0, boundary - S1)
+        time1 = work1 + wait1
+        work2 = total_time - prefix[i + 1]
+        time2 = work2
+
+        makespan = max(time1, time2)
+        if best is None or makespan < best["makespan"]:
+            best = {"split": i, "work1": work1, "wait1": wait1, "time1": time1,
+                    "work2": work2, "wait2": 0.0, "time2": time2, "makespan": makespan}
+
+    return best
+
+
+# ── 对外评估函数 ─────────────────────────────────────────────────────
+
+def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, target_ci: float = 2,
+                              port_names: dict = None) -> list:
+    """
+    对solve()跑出来的snapshots逐港口计算实际CI值，打印一张表并返回明细。
+
+    discharge_tally: 到达port X时船上POD==X的箱量(按bay)
+                      = 紧邻X之前的那个departure快照里POD==X的记录
+                      （航次起点没有"到达"这个动作，记为全0，是合理的边界情况）
+    loading_tally:    port X自己departure快照里POL==X的记录(按bay)
+    两者相加得到这一港每个bay的作业量，CI = 总量 / 最挤的相邻bay对之和。
+
+    target_ci是参考基准，不是硬约束——按目前拿到的运营经验，
+    总作业量500以内目标CI在3.5左右（对应n_bay=7下完全均匀分布的理论值），
+    不同总量级别下这个目标可能要相应调整，这里先留一个可传参的默认值，
+    不同吨位/箱量的港口不一定该用同一个数字比较。
+    """
+    port_totals = _port_bay_totals(vessel, snapshots, port_names)
+    results = [{**r, "ci": _ci_from_bay_totals(r["bay_total"])} for r in port_totals]
 
     print(f"\n──── CI评估（相邻bay对滑窗定义, target_ci={target_ci}）────")
     for r in results:
@@ -146,6 +212,45 @@ def evaluate_ci_theoretical_ceiling(vessel: Vessel) -> float:
         return float("inf")
     max_pair_share = max(share[i] + share[i + 1] for i in range(len(share) - 1))
     return 1.0 / max_pair_share
+
+
+def evaluate_crane_time(vessel: Vessel, snapshots: dict, k: int = 2, crane_rate: float = 1.0,
+                         port_names: dict = None) -> list:
+    """
+    在evaluate_crane_intensity同一份bay_total基础上，模拟k台吊车按bay升序顺序
+    作业、遇到相邻bay冲突就等待的排班过程，估算每港实际耗时Time_port，以及
+    全航次总耗时Total_voyage_time = sum(Time_port for all ports)。
+
+    目前只实现k=2：两台吊车按总量最优二分（crane1拿[0..i]、crane2拿[i+1..n-1]，
+    都从自己区间里最小的bay开始按升序作业），遍历切分点i取makespan最小的方案
+    （见_two_crane_port_schedule）。crane_rate：单位作业量对应的耗时倍率的倒数
+    （crane_rate=1.0时，作业量数字本身就是耗时单位）。
+
+    每港打印吊车1/2的作业时间(work，不含等待)、阻塞时间(wait，只有crane1可能
+    非0——这是"都按bay升序处理"的顺序假设下的直接推论，不做对称化)、这一港
+    总耗时(Time_port=makespan)；全部港口跑完后打印Total_voyage_time。
+    """
+    if k != 2:
+        raise NotImplementedError("evaluate_crane_time目前只实现k=2的排班逻辑")
+
+    port_totals = _port_bay_totals(vessel, snapshots, port_names)
+
+    results = []
+    print(f"\n──── 吊车作业耗时评估（k={k}台吊车, crane_rate={crane_rate}）────")
+    for r in port_totals:
+        sched = _two_crane_port_schedule(r["bay_total"], crane_rate=crane_rate)
+        time_port = sched["makespan"]
+        results.append({**r, **sched, "time_port": time_port})
+
+        print(f"  POL={r['pol']}({r['label']}): 切分点={sched['split']}  "
+              f"吊车1[作业={sched['work1']:.1f} 阻塞={sched['wait1']:.1f}]  "
+              f"吊车2[作业={sched['work2']:.1f} 阻塞={sched['wait2']:.1f}]  "
+              f"Time_port={time_port:.1f}")
+
+    total_voyage_time = sum(r["time_port"] for r in results)
+    print(f"\n  Total_voyage_time(全程总时间) = {total_voyage_time:.1f}")
+
+    return results
 
 
 def evaluate_pod_leverage(cbf: dict) -> dict:

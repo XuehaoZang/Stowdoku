@@ -22,7 +22,10 @@ from utils.vessel_io import (
 )
 from VesselClass import Vessel
 from CSP_solver import solve
-from utils.evaluate import evaluate_crane_intensity, evaluate_ci_theoretical_ceiling, evaluate_pod_leverage
+from utils.evaluate import (
+    evaluate_crane_intensity, evaluate_ci_theoretical_ceiling, evaluate_crane_time,
+    evaluate_pod_leverage,
+)
 
 TARGET_CI = 2.0
 # CI目标基准，对应总作业量500以内、完全均匀分布下相邻bay对占比2/n_bay的理论值
@@ -116,6 +119,7 @@ def main():
         ci_ceiling = evaluate_ci_theoretical_ceiling(vessel)
         print(f"\n[理论CI上限] 基于船舱几何，CI_ideal = {ci_ceiling:.3f}")
         evaluate_crane_intensity(vessel, snapshots, target_ci=TARGET_CI, port_names=PORT_NAMES)
+        evaluate_crane_time(vessel, snapshots, k=2, crane_rate=1.0, port_names=PORT_NAMES)
     else:
         print("\n[evaluate] 没有完整的逐港snapshots（求解失败且未走到任何一港完成），跳过CI评估")
     # evaluate_pod_leverage(original_cbf)
