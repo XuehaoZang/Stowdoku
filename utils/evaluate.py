@@ -11,8 +11,9 @@ utils/evaluate.py - 配载方案评估工具集
 - 仅供内部复用的小工具函数一律加下划线前缀（比如 _make_zones），不对外暴露。
 
 目前已有：
-- evaluate_crane_intensity: 吊车负荷强度(CI)评估
-- evaluate_pod_leverage:    POD杠杆(demand leverage)分析
+- evaluate_crane_intensity:      吊车负荷强度(CI)评估
+- evaluate_ci_theoretical_ceiling: 给定船体bay容量分布的理论CI上限
+- evaluate_pod_leverage:         POD杠杆(demand leverage)分析
 
 后续预留（还没实现，先占位注释，方便按同样的命名习惯继续加）：
 - evaluate_weight_distribution: 重量分布/重心评估
@@ -126,6 +127,25 @@ def evaluate_crane_intensity(vessel: Vessel, snapshots: dict, target_ci: float =
         print(f"  POL={r['pol']}({r['label']}): 各bay作业量=[{bay_str}]  CI={ci_str}")
 
     return results
+
+
+def evaluate_ci_theoretical_ceiling(vessel: Vessel) -> float:
+    """
+    这艘船在当前bay容量分布下能达到的理论CI上限，跟具体装了多少箱、哪个港口
+    无关，只取决于船体几何形状——可以当作"最好情况"的基准去对比实际CI值。
+
+    推导：假设总箱量W能按bay_capacity_share连续、无颗粒度限制地分配到每个bay
+    （load[bay] = W * share[bay]，share来自VesselClass.__init__里已经算好的
+    bay_capacity_share = capacity_total[bay]/总容量），代入CI定义：
+        peak_ideal = W * max_i(share[i] + share[i+1])   # 只看相邻pair
+        CI_ideal   = W / peak_ideal = 1 / max_i(share[i] + share[i+1])
+    W被约掉，这个上限只取决于share本身。
+    """
+    share = vessel.bay_capacity_share
+    if len(share) < 2:
+        return float("inf")
+    max_pair_share = max(share[i] + share[i + 1] for i in range(len(share) - 1))
+    return 1.0 / max_pair_share
 
 
 def evaluate_pod_leverage(cbf: dict) -> dict:

@@ -31,29 +31,47 @@ def cal_candidates(vessel: Vessel) -> dict:
     return choices
 
 
-def _ci_marginal_cost(vessel: Vessel, bay: int, lr: int, hd: int) -> int:
+def _ci_cell_score(vessel: Vessel, bay: int, lr: int, hd: int) -> float:
     """
-    TODO 需要继续思考有没有更好的算法来建模CI问题。
-    假设往这个cell装满(用capacity_total估算，不用实际会装多少)，
-    相邻bay对里最挤的那一对会变成多大——用来在mrv_select里挑"往哪个bay放
-    对本港CI伤害最小"的格子。
+    cell层CI评分：只用cell固有属性(capacity_total)和聚合状态(current_port_bay_load)，
+    不看实际分配的POD/demand数量。
+    假设往这个cell装满(用capacity_total估算)，跟bay直接相邻的1~2个pair
+    (bay-1,bay)和(bay,bay+1)里，"pair实际负荷 vs pair按容量比例应得预算"
+    的超出量，取两侧较大的一个；用max(0, ...)封底，未超预算记0。
+    船头/船尾只有一侧邻居时，退化成单bay超出量。
     """
-    hypothetical = vessel.current_port_bay_load.copy()
-    hypothetical[bay] += vessel.capacity_total[bay, lr, hd]
-    if len(hypothetical) < 2:
-        return int(hypothetical.sum())
-    return int(max(hypothetical[i] + hypothetical[i + 1] for i in range(len(hypothetical) - 1)))
+    load = vessel.current_port_bay_load
+    budget = vessel.port_budget
+
+    def target(b):
+        return budget * vessel.bay_capacity_share[b]
+
+    hypothetical_self = load[bay] + vessel.capacity_total[bay, lr, hd]
+
+    pair_costs = []
+    if bay - 1 >= 0:
+        pair_costs.append(max(0.0,
+            (load[bay - 1] + hypothetical_self) - (target(bay - 1) + target(bay))))
+    if bay + 1 < vessel.n_bay:
+        pair_costs.append(max(0.0,
+            (hypothetical_self + load[bay + 1]) - (target(bay) + target(bay + 1))))
+    if not pair_costs:
+        pair_costs.append(max(0.0, hypothetical_self - target(bay)))
+
+    return max(pair_costs)
 
 
-def mrv_select(choices: dict, vessel: Vessel):
+def mrv_select(choices: dict, vessel: Vessel, ci_enabled=True):
     """
     原始数独的方式是根据现在已知方格的信息确定其余方格的约束信息，从候选集最少的方格开始尝试，这里主要考虑在多种约束情况下设计剪枝规则
     选格子阶段:
     1. 特殊箱判断       -->  优先看has_reefer的（当仍有Reefer需求时）  --> 剪枝：放完GP但是RF放不了
     2. 封舱判断         -->  优先看hold 或 已占用hold上deck           --> 剪枝：直接装完deck导致封舱
     （待定3. 高箱判断         -->  优先看has_hicube的（当仍有HC需求时）      --> 剪枝：分配的位置放不进这么多高箱(暂时不加高箱规则)）
-    4. 候选集排序       -->  优先看候选可能最少的                      --> 剪枝：加快搜索
-    5. 随机数打散
+    4. CI评分           -->  优先看cell层CI评分较低的（不启用时恒为0）    --> 剪枝：避免把负荷堆到已经紧张的相邻bay对
+    5. 候选集排序       -->  优先看候选可能最少的                      --> 剪枝：加快搜索
+    6. 随机数打散
+    ci_enabled=False时用于消融实验，ci_score恒为0，排序退化成不含CI项的版本。
     返回 (bay, lr, hd)
     """
     def priority(item):
@@ -63,7 +81,8 @@ def mrv_select(choices: dict, vessel: Vessel):
             current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0 for pod in cands
         )
         is_dead_slot = hd == 1 and vessel.cell[bay, lr, 0]["POD"] == -1
-        return (0 if has_rf_need else 1, 0 if not is_dead_slot else 1, len(cands), random.random())
+        ci_score = _ci_cell_score(vessel, bay, lr, hd) if ci_enabled else 0
+        return (0 if has_rf_need else 1, 0 if not is_dead_slot else 1, ci_score, len(cands), random.random())
 
     return min(choices.items(), key=priority)[0]
 
@@ -98,18 +117,21 @@ def _total_assigned(vessel: Vessel) -> int:
 
 _solve_call_count = [0]
 
-def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
+def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=True) -> bool:
     """
     统一大递归：装载 + 换港，discharge作为递归中的特殊节点。
     vessel内部维护current_pol和cbf状态。
     best: dict容器 {"assigned": int, "vessel": Vessel或None}，
           记录搜索过程中见过的、已装箱数最多的状态快照，用于失败时输出最优近似解。
+    ci_enabled: 传给mrv_select，控制是否启用CI cell层评分，供消融实验用。
+    CI的事后评估交给utils.evaluate.evaluate_crane_intensity（基于solve()跑完后的
+    snapshots算，跨港口口径统一），不在这里自己攒诊断数据。
     """
     _solve_call_count[0] += 1
     if _solve_call_count[0] % 100000 == 0:
         print(f"[depth debug] 已调用{_solve_call_count[0]}次, current_pol={vessel.current_pol}, "
               f"total_remaining={vessel.total_remaining()}")
-    
+
     if snapshots is None:
         snapshots = {}
     if best is None:
@@ -128,7 +150,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
         discharged = vessel.discharge(vessel.current_pol)
         vessel.reset_port_bay_load(discharged)
 
-        if solve(vessel, is_debug, snapshots, best):
+        if solve(vessel, is_debug, snapshots, best, ci_enabled):
             return True
 
         # 下一港失败，回溯
@@ -149,10 +171,10 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
     if not choices:
         # 所有空cell的cbf候选都已耗尽，等价于port_complete
         # 下一次递归开头的port_complete()会处理换港
-        return solve(vessel, is_debug, snapshots, best)
+        return solve(vessel, is_debug, snapshots, best, ci_enabled)
 
     # MRV选位置
-    pos = mrv_select(choices, vessel)
+    pos = mrv_select(choices, vessel, ci_enabled)
     bay, lr, hd = pos
 
     for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd):
@@ -163,7 +185,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None) -> bool:
             best["assigned"] = current_total
             best["vessel"] = copy.deepcopy(vessel)
 
-        if solve(vessel, is_debug, snapshots, best):
+        if solve(vessel, is_debug, snapshots, best, ci_enabled):
             return True
 
         vessel.unassign(bay, lr, hd, pod)

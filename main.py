@@ -22,11 +22,14 @@ from utils.vessel_io import (
 )
 from VesselClass import Vessel
 from CSP_solver import solve
-from utils.evaluate import evaluate_crane_intensity, evaluate_pod_leverage
+from utils.evaluate import evaluate_crane_intensity, evaluate_ci_theoretical_ceiling, evaluate_pod_leverage
 
 TARGET_CI = 2.0
 # CI目标基准，对应总作业量500以内、完全均匀分布下相邻bay对占比2/n_bay的理论值
 # 不是硬约束，只是打印时用来标注"低于目标"，不同总量级别可能需要另外校准
+
+CI_ENABLED = True
+# 消融实验开关，透传给solve()->mrv_select，控制cell层CI评分是否启用
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
 GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
@@ -78,7 +81,7 @@ def main():
 
     snapshots = {}
     best = {"assigned": -1, "vessel": None}
-    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, ci_enabled=CI_ENABLED)
 
     if success:
         result_vessel = vessel
@@ -109,10 +112,12 @@ def main():
                     port_label = PORT_NAMES.get(pod, pod)
                     print(f"    POL={pol} POD={port_label}: {counts}")
 
-    # if snapshots:
-    #     evaluate_crane_intensity(vessel, snapshots, target_ci=TARGET_CI, port_names=PORT_NAMES)
-    # else:
-    #     print("\n[evaluate] 没有完整的逐港snapshots（求解失败且未走到任何一港完成），跳过CI评估")
+    if snapshots:
+        ci_ceiling = evaluate_ci_theoretical_ceiling(vessel)
+        print(f"\n[理论CI上限] 基于船舱几何，CI_ideal = {ci_ceiling:.3f}")
+        evaluate_crane_intensity(vessel, snapshots, target_ci=TARGET_CI, port_names=PORT_NAMES)
+    else:
+        print("\n[evaluate] 没有完整的逐港snapshots（求解失败且未走到任何一港完成），跳过CI评估")
     # evaluate_pod_leverage(original_cbf)
 
     paths = vessel.export_bayplan(snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_plot_phy=False)

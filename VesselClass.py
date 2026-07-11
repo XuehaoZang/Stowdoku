@@ -64,6 +64,10 @@ class Vessel:
         self.n_bay = self.is_valid.shape[0]
         # 搜索空间的bay数量，测试时按传入的full_slot_table定，STSE时7
 
+        self.bay_capacity_share = self.capacity_total.sum(axis=(1, 2)) / self.capacity_total.sum()
+        # bay_capacity_share[bay]: 该bay物理容量(capacity_total)占全船总容量的比例，
+        # 静态、只算一次，供CSP_solver的CI cell层评分把"预算"按容量比例分摊到各bay用
+
         self.current_port_bay_load = np.zeros(self.n_bay, dtype=int)
         # current_port_bay_load[bay]: 当前港口这个bay累计的吊车作业量
         # （卸箱+本港装箱），供CSP_solver的CI打分用。换港时通过reset_port_bay_load
@@ -98,6 +102,11 @@ class Vessel:
         self.tail_threshold = tail_threshold
         # 单个POD剩余需求 <= 此阈值时，视为"尾货"，不再主动占用cell，
         # 留到求解结束后统一打印，交给后续人工/专门策略处理
+
+        self.port_budget = self.total_remaining()
+        # 这一港开始装货前的剩余总量快照，港内固定不变，供CI cell层评分
+        # 按bay_capacity_share分摊"应得预算"用。换港时在reset_port_bay_load里
+        # 用同样的方式重新赋值。
 
     # ── 构造 ───────────────────────────────────────────────────────────
 
@@ -292,6 +301,12 @@ class Vessel:
         self.current_port_bay_load = np.zeros(self.n_bay, dtype=int)
         for bay, lr, hd, record in discharged:
             self.current_port_bay_load[bay] += record["GP_count"] + record["RF_count"]
+
+        # current_pol可能已经越过最后一个真实POL(比如末港discharge后的哨兵态)，
+        # 此时self.cbf里没有这个key，total_remaining()会KeyError——但solve()
+        # 马上就会在下一次递归开头判定current_pol > max(cbf.keys())并返回，
+        # port_budget在那之前不会被读取，这里安全地留空即可。
+        self.port_budget = self.total_remaining() if self.current_pol in self.cbf else 0
 
     def advance_pol(self):
         """换港：current_pol指针+1。"""
