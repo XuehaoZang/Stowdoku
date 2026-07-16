@@ -27,8 +27,8 @@ from utils.vessel_io import (
     batch_parse_cbf, STSE_PORT_MAP
 )
 from VesselClass import Vessel
-from CSP_solver import solve
-from utils.evaluate import evaluate_crane_time
+from CSP_solver import solve, reset_small_pod_ci_stats, _small_pod_ci_stats
+from utils.evaluate import evaluate_crane_time, evaluate_pod_discharge_spread
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
 GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
@@ -77,19 +77,33 @@ def main():
 
     # 实验参数设置
     seeds = [42, 54, 87, 100, 35, 7, 49, 23, 66, 88]
-    groups = {"CI_OFF": False, "CI_ON": True}
-    
+    # 2x2消融：ci_pol_enabled(cell层CI，选格子阶段) × ci_pod_enabled(箱子层CI，选箱子阶段)
+    groups = {
+        "POL_ON_POD_ON":   (True,  True),
+        "POL_ON_POD_OFF":  (True,  False),
+        "POL_OFF_POD_ON":  (False, True),
+        "POL_OFF_POD_OFF": (False, False),
+    }
+
     summary_data = []
 
     print("\n================ 开始跑批测试 ================\n")
 
-    for group_name, ci_status in groups.items():
-        print(f"▶ 正在执行组别: {group_name} (ci_enabled={ci_status})")
+    for group_name, (ci_pol_status, ci_pod_status) in groups.items():
+        print(f"▶ 正在执行组别: {group_name} "
+              f"(ci_pol_enabled={ci_pol_status}, ci_pod_enabled={ci_pod_status})")
 
         group_results = []
         best_record_for_group = None   # 存整条记录，不再分列各自求min
         best_vessel_for_group = None      # 存对象，用于导出bayplan
         best_snapshots = None
+
+        # 组级discharge_spread汇总：跨这一组所有种子、所有POD拉平在一起算均值
+        spread_variances = []
+        spread_ranges = []
+        spread_cis = []
+
+        reset_small_pod_ci_stats()
 
         for seed in seeds:
             random.seed(seed)
@@ -98,7 +112,8 @@ def main():
             best = {"assigned": -1, "vessel": None}
 
             start_time = time.time()
-            success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, ci_enabled=ci_status)
+            success = solve(vessel, is_debug=False, snapshots=snapshots, best=best,
+                             ci_pol_enabled=ci_pol_status, ci_pod_enabled=ci_pod_status)
             exec_time = time.time() - start_time
 
             result_vessel = vessel if success else best["vessel"]
@@ -124,6 +139,14 @@ def main():
                 total_work = sum(r["work1"] + r["work2"] for r in crane_res)
                 total_capacity = sum(2 * r["time_port"] for r in crane_res)
                 voyage_utilization = total_work / total_capacity if total_capacity > 0 else None
+
+                spread_report = evaluate_pod_discharge_spread(result_vessel, snapshots,
+                                                               port_names=PORT_NAMES, if_debug=False)
+                for stats in spread_report.values():
+                    spread_variances.append(stats["variance"])
+                    spread_ranges.append(stats["range"])
+                    if stats["ci"] is not None:
+                        spread_cis.append(stats["ci"])
 
             record = {
                 "seed": seed,
@@ -164,6 +187,20 @@ def main():
                 f"尾箱={b['tail_boxes']}, 阻塞耗时={b['total_wait_time']:.1f}, "
                 f"全程耗时={b['total_voyage_time']:.1f}, "
                 f"利用率={b['voyage_utilization']:.3f}" if b['voyage_utilization'] is not None else "N/A")
+
+        # discharge_spread组级汇总（所有POD×所有种子拉平算均值，不逐POD逐种子明细）
+        if spread_variances:
+            print(f"  📊 discharge_spread 组汇总(全部POD×全部种子, n={len(spread_variances)}): "
+                  f"variance均值={np.mean(spread_variances):.3f}, "
+                  f"range均值={np.mean(spread_ranges):.3f}, "
+                  f"CI均值={np.mean(spread_cis):.3f}" if spread_cis else "CI均值=N/A")
+
+        # 小POD误伤诊断：只在ci_pod_enabled=True的组里有意义（False组从不调用_ci_future_pod_score）
+        if ci_pod_status:
+            triggered = _small_pod_ci_stats["triggered"]
+            total = _small_pod_ci_stats["total"]
+            print(f"  🔎 小POD(D_pod<15)触发高Cost_adj(>0.5)次数: {triggered} / 总打分次数: {total}")
+
         print("-" * 60)
 
     # 打印最终对比结果
@@ -172,7 +209,7 @@ def main():
     print(df_summary.to_string(index=False))
 
     # 你可以在这里导出最优解的 bayplan:
-    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=True)
+    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
 
 if __name__ == "__main__":
     main()

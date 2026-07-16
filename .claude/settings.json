@@ -7,7 +7,11 @@
       "Bash(mkdir -p /tmp/baseline_test 2>/dev/null; git show HEAD:CSP_solver.py > \"C:/Users/zacha/AppData/Local/Temp/claude/d--Stowage-Stowdoku/b37d0cac-f92d-4b30-bd05-8c5a1393720f/scratchpad/CSP_solver_baseline.py\" *)",
       "Bash(python -)",
       "Bash(sed -i '/already current VesselClass/d' C:/Users/zacha/AppData/Local/Temp/claude/d--Stowage-Stowdoku/b37d0cac-f92d-4b30-bd05-8c5a1393720f/scratchpad/compare_regression.py)",
-      "Bash(PYTHONIOENCODING=utf-8 d:/Stowage/Stowdoku/.venv/Scripts/python.exe C:/Users/zacha/AppData/Local/Temp/claude/d--Stowage-Stowdoku/b37d0cac-f92d-4b30-bd05-8c5a1393720f/scratchpad/compare_regression.py)"
+      "Bash(PYTHONIOENCODING=utf-8 d:/Stowage/Stowdoku/.venv/Scripts/python.exe C:/Users/zacha/AppData/Local/Temp/claude/d--Stowage-Stowdoku/b37d0cac-f92d-4b30-bd05-8c5a1393720f/scratchpad/compare_regression.py)",
+      "Bash(./.venv/Scripts/python.exe -m py_compile CSP_solver.py main.py VesselClass.py utils/evaluate.py)",
+      "Bash(python -c \"import VesselClass\")",
+      "Bash(./.venv/Scripts/python.exe -m py_compile utils/evaluate.py)",
+      "Bash(./.venv/Scripts/python.exe -m py_compile CSP_solver.py)"
     ],
     "additionalDirectories": [
       "\\tmp"

@@ -96,6 +96,24 @@ def _pod_bay_footprint(vessel: Vessel) -> dict:
     return footprints
 
 
+SMALL_POD_DEMAND_THRESHOLD = 15
+# D_pod低于此值视为"小POD"，供_small_pod_ci_stats误伤诊断用，改这个数即可调阈值
+
+HIGH_COST_ADJ_THRESHOLD = 0.5
+# Cost_adj(邻居影响项)超过此值视为"高Cost_adj"，供_small_pod_ci_stats误伤诊断用
+
+_small_pod_ci_stats = {"triggered": 0, "total": 0}
+# 小POD误伤诊断计数器：total=_ci_future_pod_score实际算出Cost_adj的次数，
+# triggered=其中D_pod<SMALL_POD_DEMAND_THRESHOLD且Cost_adj>HIGH_COST_ADJ_THRESHOLD的次数。
+# 只做频率统计，不记录具体POD/bay，main.py每组实验开始前调用reset_small_pod_ci_stats()清零。
+
+
+def reset_small_pod_ci_stats():
+    """重置小POD误伤诊断计数器，供main.py每组(ci_pol_enabled, ci_pod_enabled)实验开始前调用。"""
+    _small_pod_ci_stats["triggered"] = 0
+    _small_pod_ci_stats["total"] = 0
+
+
 def _ci_future_pod_score(vessel: Vessel, bay: int, lr: int, hd: int, pod, footprint: dict, pod_total_demand: dict) -> float:
     """
     箱子层CI评分：给"往(bay,lr,hd)装POD=pod"这个选择打分，衡量对该POD自身
@@ -106,6 +124,9 @@ def _ci_future_pod_score(vessel: Vessel, bay: int, lr: int, hd: int, pod, footpr
     - Cost_intra: 内部影响。该POD在本bay内（放了这个cell之后）是否超过本bay容量的一半
       （超过半舱意味着这个bay要为这个POD单独作业一整趟吊车，intra-bay堆叠代价）。
     D_pod<=0（这个POD根本没有总需求）时直接返回0，避免除零。
+
+    每次算出Cost_adj都会顺带更新_small_pod_ci_stats，用于诊断"小POD是否容易被
+    误判为高CI代价"（小D_pod会放大Cost_adj，不代表这个POD真的造成了很大的吊车负荷）。
     """
     D_pod = pod_total_demand.get(pod, 0)
     if D_pod <= 0:
@@ -121,22 +142,26 @@ def _ci_future_pod_score(vessel: Vessel, bay: int, lr: int, hd: int, pod, footpr
     )
     Cost_adj = neighbor_max / D_pod
 
+    _small_pod_ci_stats["total"] += 1
+    if D_pod < SMALL_POD_DEMAND_THRESHOLD and Cost_adj > HIGH_COST_ADJ_THRESHOLD:
+        _small_pod_ci_stats["triggered"] += 1
+
     Cap_bay = vessel.capacity_total[bay].sum()
     Cost_intra = max(0, fp[bay] + vessel.capacity_total[bay, lr, hd] - Cap_bay / 2) / D_pod
 
     return Cost_adj + Cost_intra
 
 
-def mrv_select(choices: dict, vessel: Vessel, ci_enabled=True):
+def mrv_select(choices: dict, vessel: Vessel, ci_pol_enabled=True):
     """
     原始数独的方式是根据现在已知方格的信息确定其余方格的约束信息，从候选集最少的方格开始尝试，这里主要考虑在多种约束情况下设计剪枝规则
     选格子阶段:
     1. 特殊箱判断       -->  优先看has_reefer的（当仍有Reefer需求时）  --> 剪枝：放完GP但是RF放不了
     2. 封舱判断         -->  优先看hold 或 已占用hold上deck           --> 剪枝：直接装完deck导致封舱
-    3. CI评分           -->  优先看cell层对当前POL的影响（ci_enabled控制）    --> 剪枝：避免把负荷堆到已经紧张的相邻bay对
+    3. CI评分           -->  优先看cell层对当前POL的影响（ci_pol_enabled控制）    --> 剪枝：避免把负荷堆到已经紧张的相邻bay对
     5. 候选集排序       -->  优先看候选可能最少的                      --> 剪枝：加快搜索
     6. 随机数打散
-    ci_enabled=False时用于消融实验，ci_score恒为0，排序退化成不含CI项的版本。
+    ci_pol_enabled=False时用于消融实验，ci_score恒为0，排序退化成不含CI项的版本。
     返回 (bay, lr, hd)
     """
     def priority(item):
@@ -146,29 +171,31 @@ def mrv_select(choices: dict, vessel: Vessel, ci_enabled=True):
             current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0 for pod in cands
         )
         is_dead_slot = hd == 1 and vessel.cell[bay, lr, 0]["POD"] == -1
-        ci_score = _ci_current_pol_score(vessel, bay, lr, hd) if ci_enabled else 0
+        ci_score = _ci_current_pol_score(vessel, bay, lr, hd) if ci_pol_enabled else 0
         return (0 if has_rf_need else 1, 0 if not is_dead_slot else 1, ci_score, len(cands), random.random())
 
     return min(choices.items(), key=priority)[0]
 
-def _pod_try_order(cands, vessel, bay, lr, hd, pod_ci_enabled=True):
+def _pod_try_order(cands, vessel, bay, lr, hd, ci_pod_enabled=True):
     """
     选箱子来填格子阶段：_pod_try_order
     1. 特殊箱匹配：哪个港口有reefer箱子，根据格子的冰箱容量进行匹配
-    2. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）(pod_ci_enabled控制)
+    2. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）(ci_pod_enabled控制)
     3. 箱重匹配（旨在让空箱上浮（甲板上堆高）重箱下沉（舱底））（TODO 未来实现）
     4. 重量平衡（往这个bay放POD=?的箱子可以改善重量平衡？）（TODO 未来实现）
     5. 按照POD rel_rank降序（先装目的地远的箱子 TODO 先远后近是好的策略吗）
-    pod_ci_enabled=False时用于消融实验，退回历史基线排序(rf_need, pod)，
-    不计算_ci_future_pod_score/rel_rank。
+    ci_pod_enabled=False时用于消融实验，退回历史基线排序(rf_need, rel_rank)，
+    不计算_ci_future_pod_score。
+    兜底项用rel_rank(pod)而不是原始pod编号：pod编号只是港口表里的任意序号，
+    没有业务含义，rel_rank是相对current_pol的挂靠距离，作为兜底更有意义。
     """
     current_cbf = vessel.cbf[vessel.current_pol]
     has_reefer_here = vessel.has_reefer[bay, lr, hd]
 
-    if not pod_ci_enabled:
+    if not ci_pod_enabled:
         def key(pod):
             rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
-            return (0 if rf_need else 1, pod)
+            return (0 if rf_need else 1, vessel.rel_rank(pod))
 
         return sorted(cands, key=key)
 
@@ -178,7 +205,7 @@ def _pod_try_order(cands, vessel, bay, lr, hd, pod_ci_enabled=True):
     def key(pod):
         rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
         ci_score = _ci_future_pod_score(vessel, bay, lr, hd, pod, footprint, pod_total_demand)
-        return (0 if rf_need else 1, ci_score, -vessel.rel_rank(pod), pod)
+        return (0 if rf_need else 1, ci_score, -vessel.rel_rank(pod), vessel.rel_rank(pod))
 
     return sorted(cands, key=key)
 
@@ -195,14 +222,14 @@ def _total_assigned(vessel: Vessel) -> int:
 
 _solve_call_count = [0]
 
-def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=True, pod_ci_enabled=True) -> bool:
+def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_pol_enabled=True, ci_pod_enabled=True) -> bool:
     """
     统一大递归：装载 + 换港，discharge作为递归中的特殊节点。
     vessel内部维护current_pol和cbf状态。
     best: dict容器 {"assigned": int, "vessel": Vessel或None}，
           记录搜索过程中见过的、已装箱数最多的状态快照，用于失败时输出最优近似解。
-    ci_enabled: 传给mrv_select，控制是否启用CI cell层评分，供消融实验用。
-    pod_ci_enabled: 传给_pod_try_order，控制是否启用箱子层CI评分，供消融实验用。
+    ci_pol_enabled: 传给mrv_select，控制是否启用CI cell层评分，供消融实验用。
+    ci_pod_enabled: 传给_pod_try_order，控制是否启用箱子层CI评分，供消融实验用。
     CI的事后评估交给utils.evaluate.evaluate_crane_intensity（基于solve()跑完后的
     snapshots算，跨港口口径统一），不在这里自己攒诊断数据。
     """
@@ -229,7 +256,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=
         discharged = vessel.discharge(vessel.current_pol)
         vessel.reset_port_bay_load(discharged)
 
-        if solve(vessel, is_debug, snapshots, best, ci_enabled, pod_ci_enabled):
+        if solve(vessel, is_debug, snapshots, best, ci_pol_enabled, ci_pod_enabled):
             return True
 
         # 下一港失败，回溯
@@ -250,13 +277,13 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=
     if not choices:
         # 所有空cell的cbf候选都已耗尽，等价于port_complete
         # 下一次递归开头的port_complete()会处理换港
-        return solve(vessel, is_debug, snapshots, best, ci_enabled, pod_ci_enabled)
+        return solve(vessel, is_debug, snapshots, best, ci_pol_enabled, ci_pod_enabled)
 
     # MRV选位置
-    pos = mrv_select(choices, vessel, ci_enabled)
+    pos = mrv_select(choices, vessel, ci_pol_enabled)
     bay, lr, hd = pos
 
-    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd, pod_ci_enabled):
+    for pod in _pod_try_order(choices[pos], vessel, bay, lr, hd, ci_pod_enabled):
         vessel.assign(bay, lr, hd, pod)
 
         current_total = _total_assigned(vessel)
@@ -264,7 +291,7 @@ def solve(vessel: Vessel, is_debug=False, snapshots=None, best=None, ci_enabled=
             best["assigned"] = current_total
             best["vessel"] = copy.deepcopy(vessel)
 
-        if solve(vessel, is_debug, snapshots, best, ci_enabled, pod_ci_enabled):
+        if solve(vessel, is_debug, snapshots, best, ci_pol_enabled, ci_pod_enabled):
             return True
 
         vessel.unassign(bay, lr, hd, pod)
@@ -398,7 +425,7 @@ if __name__ == "__main__":
 
     snapshots = {}
     best = {"assigned": -1, "vessel": None}
-    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, pod_ci_enabled=True)
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best, ci_pod_enabled=True)
 
     if success:
         print("\n──── Solution Found ────")
@@ -530,3 +557,34 @@ if __name__ == "__main__":
            f"score(D=12)={score_small_D}, score(D=300)={score_large_D}")
 
     print("阶段2 smoke test all passed")
+
+    # ──────────────────────────────────────────────────────────────
+    # 阶段4冒烟测：evaluate_pod_discharge_spread
+    # 复用上面ci_pod_enabled=True跑出来的snapshots，不重新solve()，
+    # 只验证函数本身算得对不对（不对照ci_pod_enabled=False，那是后续
+    # 10-seed实验的事）。
+    # ──────────────────────────────────────────────────────────────
+    from utils.evaluate import evaluate_pod_discharge_spread
+
+    print("\n──── 阶段4 smoke test: evaluate_pod_discharge_spread ────")
+    spread_report = evaluate_pod_discharge_spread(vessel, snapshots, if_debug=True)
+
+    print("\n手动核对（挑1-2个POD核对variance/range是否吻合discharge_tally）：")
+    from utils.evaluate import _port_bay_totals
+    port_totals = _port_bay_totals(vessel, snapshots)
+    checked = 0
+    for r in port_totals:
+        if r["discharge_tally"].sum() == 0 or checked >= 2:
+            continue
+        pod = r["pol"]
+        tally = r["discharge_tally"]
+        manual_variance = float(np.var(tally))
+        manual_range = int(tally.max() - tally.min())
+        reported = spread_report[pod]
+        print(f"  POD={pod}: discharge_tally={list(tally)}, "
+              f"手算variance={manual_variance:.4f} (函数返回{reported['variance']:.4f}), "
+              f"手算range={manual_range} (函数返回{reported['range']})")
+        assert manual_variance == reported["variance"], f"[FAILED] POD={pod} variance不一致"
+        assert manual_range == reported["range"], f"[FAILED] POD={pod} range不一致"
+        checked += 1
+    print("阶段4 smoke test all passed")

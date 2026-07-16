@@ -118,6 +118,22 @@ class Vessel:
         # 回退这两处写self.cbf的副作用必须对同一个(POL,POD)分组只生效一次，
         # 否则export_bayplan对每个POL都调用一次proj_cell_to_vessel会导致重复计入。
 
+        self._tail_source2_log = []
+        # 尾箱来源2（HC降级挤出腾空）诊断日志：每次proj_cell_to_vessel触发deck摞
+        # 腾空就追加一条(POL, POD)记录，不去重（同一(POL,POD)在多个POL快照里
+        # 重算是幂等的物理动作，每次真实发生都要记一笔，跟_hc_cbf_writeback_seen
+        # 控制的cbf写回去重是两回事）。供utils/tail.py统计用，只读不影响求解逻辑。
+
+        self._tail_source3_log = []
+        # 尾箱来源3（HC/RF贴标签预算池分不完回退）诊断日志：proj_cell_to_vessel
+        # 里"预算池分不完，把这部分HC/HR demand回退进cbf余量"那一段触发时追加
+        # 一条(POL, POD, gp_hc_budget_leftover, rf_hc_budget_leftover)记录。
+        # 跟来源2(deck-squeeze)是两条独立的写回路径，故意不合并成一个log：
+        # 来源2每次触发固定回退1个GP名额(数量恒为1)，来源3每个(POL,POD)分组
+        # 只触发一次但回退量可以是任意正整数(gp_hc_budget/rf_hc_budget剩多少
+        # 就回退多少)，两者的记录粒度和字段形状本来就不一样，分开存更直接，
+        # 不用靠一个kind字段再反向拆分成两种不同shape的tuple。
+
     # ── 构造 ───────────────────────────────────────────────────────────
 
     @classmethod
@@ -609,6 +625,9 @@ class Vessel:
                         release_row = slots.at[idx_release, "row_idx"]
                         release_tier = slots.at[idx_release, "tier_idx"]
 
+                        print(f"[尾箱来源2] deck摞腾空回退触发: POL={pol}, POD={pod}, 数量=1")
+                        self._tail_source2_log.append((pol, pod))
+
                         for target_idx in [idx_release] + list(slots.index[
                             (slots.bay_idx == b1)
                             & (slots.row_idx == release_row)
@@ -624,9 +643,18 @@ class Vessel:
                             cbf_demand = self.cbf[pol][pod]
                             cbf_demand["GP"] = cbf_demand.get("GP", 0) + 1
 
+            if gp_hc_budget > 0 or rf_hc_budget > 0:
+                # 预算池分不完——跟deck-squeeze一样是幂等的计算结果，每次
+                # proj_cell_to_vessel重算这个(POL,POD)分组都会得到同样的
+                # gp_hc_budget/rf_hc_budget，所以每次触发都记一笔（不受
+                # already_written限制），真正写回self.cbf才需要去重一次。
+                print(f"[尾箱来源3] HC/RF预算池分不完回退触发: POL={pol}, POD={pod}, "
+                      f"gp_hc_budget={gp_hc_budget}, rf_hc_budget={rf_hc_budget}")
+                self._tail_source3_log.append((pol, pod, gp_hc_budget, rf_hc_budget))
+
             if not already_written and (gp_hc_budget > 0 or rf_hc_budget > 0):
-                # 预算池分不完——把这部分HC/HR demand回退进cbf余量，
-                # 跟真正没找到地方放的尾货合并存放。
+                # 把这部分HC/HR demand回退进cbf余量，跟真正没找到地方放的
+                # 尾货合并存放。
                 cbf_demand = self.cbf[pol][pod]
                 cbf_demand["HC"] = cbf_demand.get("HC", 0) + gp_hc_budget
                 cbf_demand["HR"] = cbf_demand.get("HR", 0) + rf_hc_budget
