@@ -625,7 +625,7 @@ class Vessel:
                         release_row = slots.at[idx_release, "row_idx"]
                         release_tier = slots.at[idx_release, "tier_idx"]
 
-                        print(f"[尾箱来源2] deck摞腾空回退触发: POL={pol}, POD={pod}, 数量=1")
+                        # print(f"[尾箱来源2] deck摞腾空回退触发: POL={pol}, POD={pod}, 数量=1")
                         self._tail_source2_log.append((pol, pod))
 
                         for target_idx in [idx_release] + list(slots.index[
@@ -643,14 +643,14 @@ class Vessel:
                             cbf_demand = self.cbf[pol][pod]
                             cbf_demand["GP"] = cbf_demand.get("GP", 0) + 1
 
-            if gp_hc_budget > 0 or rf_hc_budget > 0:
+            # if gp_hc_budget > 0 or rf_hc_budget > 0:
                 # 预算池分不完——跟deck-squeeze一样是幂等的计算结果，每次
                 # proj_cell_to_vessel重算这个(POL,POD)分组都会得到同样的
                 # gp_hc_budget/rf_hc_budget，所以每次触发都记一笔（不受
                 # already_written限制），真正写回self.cbf才需要去重一次。
-                print(f"[尾箱来源3] HC/RF预算池分不完回退触发: POL={pol}, POD={pod}, "
-                      f"gp_hc_budget={gp_hc_budget}, rf_hc_budget={rf_hc_budget}")
-                self._tail_source3_log.append((pol, pod, gp_hc_budget, rf_hc_budget))
+                # print(f"[尾箱来源3] HC/RF预算池分不完回退触发: POL={pol}, POD={pod}, "
+                #       f"gp_hc_budget={gp_hc_budget}, rf_hc_budget={rf_hc_budget}")
+                # self._tail_source3_log.append((pol, pod, gp_hc_budget, rf_hc_budget))
 
             if not already_written and (gp_hc_budget > 0 or rf_hc_budget > 0):
                 # 把这部分HC/HR demand回退进cbf余量，跟真正没找到地方放的

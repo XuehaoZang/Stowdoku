@@ -141,16 +141,7 @@ def _ci_future_pod_score(vessel: Vessel, bay: int, lr: int, hd: int, pod, footpr
         fp[bay + 1] if bay + 1 < vessel.n_bay else 0,
     )
     Cost_adj = neighbor_max / D_pod
-
-    _small_pod_ci_stats["total"] += 1
-    if D_pod < SMALL_POD_DEMAND_THRESHOLD and Cost_adj > HIGH_COST_ADJ_THRESHOLD:
-        _small_pod_ci_stats["triggered"] += 1
-
-    Cap_bay = vessel.capacity_total[bay].sum()
-    Cost_intra = max(0, fp[bay] + vessel.capacity_total[bay, lr, hd] - Cap_bay / 2) / D_pod
-
-    return Cost_adj + Cost_intra
-
+    return Cost_adj
 
 def mrv_select(choices: dict, vessel: Vessel, ci_pol_enabled=True):
     """
@@ -180,14 +171,13 @@ def _pod_try_order(cands, vessel, bay, lr, hd, ci_pod_enabled=True):
     """
     选箱子来填格子阶段：_pod_try_order
     1. 特殊箱匹配：哪个港口有reefer箱子，根据格子的冰箱容量进行匹配
-    2. CI打分（往这个bay放POD=?的箱子可以改善整体CI？）(ci_pod_enabled控制)
+    2. CI_POD打分（往这个bay放POD=?的箱子可以改善整体CI？）(ci_pod_enabled控制)
     3. 箱重匹配（旨在让空箱上浮（甲板上堆高）重箱下沉（舱底））（TODO 未来实现）
     4. 重量平衡（往这个bay放POD=?的箱子可以改善重量平衡？）（TODO 未来实现）
-    5. 按照POD rel_rank降序（先装目的地远的箱子 TODO 先远后近是好的策略吗）
+    5. 随机数打散
     ci_pod_enabled=False时用于消融实验，退回历史基线排序(rf_need, rel_rank)，
     不计算_ci_future_pod_score。
-    兜底项用rel_rank(pod)而不是原始pod编号：pod编号只是港口表里的任意序号，
-    没有业务含义，rel_rank是相对current_pol的挂靠距离，作为兜底更有意义。
+    兜底项用随机比用rel_rank(pod)效果更好。
     """
     current_cbf = vessel.cbf[vessel.current_pol]
     has_reefer_here = vessel.has_reefer[bay, lr, hd]
@@ -195,7 +185,8 @@ def _pod_try_order(cands, vessel, bay, lr, hd, ci_pod_enabled=True):
     if not ci_pod_enabled:
         def key(pod):
             rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
-            return (0 if rf_need else 1, vessel.rel_rank(pod))
+            return (0 if rf_need else 1, random.random())
+            # return (0 if rf_need else 1, vessel.rel_rank(pod))
 
         return sorted(cands, key=key)
 
@@ -205,7 +196,7 @@ def _pod_try_order(cands, vessel, bay, lr, hd, ci_pod_enabled=True):
     def key(pod):
         rf_need = has_reefer_here and current_cbf[pod].get("RF", 0) + current_cbf[pod].get("HR", 0) > 0
         ci_score = _ci_future_pod_score(vessel, bay, lr, hd, pod, footprint, pod_total_demand)
-        return (0 if rf_need else 1, ci_score, -vessel.rel_rank(pod), vessel.rel_rank(pod))
+        return (0 if rf_need else 1, ci_score, random.random())
 
     return sorted(cands, key=key)
 
