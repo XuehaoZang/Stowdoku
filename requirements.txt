@@ -1,4 +1,4 @@
 # Data
 pandas>=2.2.0
 numpy>=2.0.0
-matplotlib
+matplotlib>=3.8.0

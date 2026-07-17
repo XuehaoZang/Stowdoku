@@ -29,6 +29,7 @@ from utils.vessel_io import (
 from VesselClass import Vessel
 from CSP_solver import solve, reset_small_pod_ci_stats, _small_pod_ci_stats
 from utils.evaluate import evaluate_crane_time, evaluate_pod_discharge_spread
+from utils.tail import build_unified_tail_list, scan_host_candidates, match_tails_to_hosts
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
 GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
@@ -76,22 +77,23 @@ def main():
     original_cbf = copy.deepcopy(base_vessel.cbf)
 
     # 实验参数设置
-    seeds = [8245, 2817, 6490, 1757, 4073, 6612, 80, 3991, 6813, 7519,
-         8607, 6950, 3128, 9071, 124, 8300, 1327, 9367, 3274, 7276,
-         3066, 2166, 1464, 6874, 8985, 5833, 5750, 6326, 4255, 7361,
-         1682, 7897, 8450, 5633, 1354, 2802, 3001, 9830, 6909, 6430,
-         4428, 2576, 6710, 5293, 5169, 2301, 4915, 4578, 9232, 507,
-         7925, 5761, 9663, 2689, 8645, 7896, 5785, 1965, 2731, 2232,
-         8003, 6176, 3362, 4619, 4929, 3187, 1540, 898, 3273, 4265,
-         4897, 3327, 858, 4889, 3839, 7382, 8850, 5670, 3775, 42,
-         5602, 2395, 6084, 5245, 1095, 8587, 7321, 423, 9186, 8983,
-         6692, 9527, 2063, 4235, 3320, 5648, 3081, 2277, 1899, 455]
+    seeds = [8245, 2817, 6490, 1757, 4073, 6612, 80, 3991, 6813, 7519]
+    # seeds = [8245, 2817, 6490, 1757, 4073, 6612, 80, 3991, 6813, 7519,
+    #      8607, 6950, 3128, 9071, 124, 8300, 1327, 9367, 3274, 7276,
+    #      3066, 2166, 1464, 6874, 8985, 5833, 5750, 6326, 4255, 7361,
+    #      1682, 7897, 8450, 5633, 1354, 2802, 3001, 9830, 6909, 6430,
+    #      4428, 2576, 6710, 5293, 5169, 2301, 4915, 4578, 9232, 507,
+    #      7925, 5761, 9663, 2689, 8645, 7896, 5785, 1965, 2731, 2232,
+    #      8003, 6176, 3362, 4619, 4929, 3187, 1540, 898, 3273, 4265,
+    #      4897, 3327, 858, 4889, 3839, 7382, 8850, 5670, 3775, 42,
+    #      5602, 2395, 6084, 5245, 1095, 8587, 7321, 423, 9186, 8983,
+    #      6692, 9527, 2063, 4235, 3320, 5648, 3081, 2277, 1899, 455]
     # 2x2消融：ci_pol_enabled(cell层CI，选格子阶段) × ci_pod_enabled(箱子层CI，选箱子阶段)
     groups = {
         "POL_ON_POD_ON":   (True,  True),
-        "POL_ON_POD_OFF":  (True,  False),
-        "POL_OFF_POD_ON":  (False, True),
-        "POL_OFF_POD_OFF": (False, False),
+        # "POL_ON_POD_OFF":  (True,  False),
+        # "POL_OFF_POD_ON":  (False, True),
+        # "POL_OFF_POD_OFF": (False, False),
     }
 
     summary_data = []
@@ -197,18 +199,33 @@ def main():
                 f"全程耗时={b['total_voyage_time']:.1f}, "
                 f"利用率={b['voyage_utilization']:.3f}" if b['voyage_utilization'] is not None else "N/A")
 
+            # 尾箱后处理：对组最优解跑一遍完整链路 build_unified_tail_list ->
+            # scan_host_candidates -> match_tails_to_hosts，产出尾箱安置台账。
+            # final_cbf必须在build_unified_tail_list(内部会调用proj_cell_to_vessel
+            # 写回best_vessel_for_group.cbf)之前深拷贝，理由同utils/tail.py里的
+            # 同款注释：来源1读的是proj_cell_to_vessel执行前的cbf切面。
+            if best_snapshots:
+                final_cbf = copy.deepcopy(best_vessel_for_group.cbf)
+                unified_tail_list = build_unified_tail_list(
+                    best_vessel_for_group, final_cbf, best_snapshots, original_cbf
+                )
+                host_pool = scan_host_candidates(best_vessel_for_group, best_snapshots)
+                placements, unplaced = match_tails_to_hosts(
+                    unified_tail_list, host_pool,
+                    best_vessel_for_group.port_min, best_vessel_for_group.n_ports)
+
+                tail_total = sum(rec["count"] for rec in unified_tail_list)
+                placed_total = sum(p["count"] for p in placements)
+                unplaced_total = sum(u["count"] for u in unplaced)
+                print(f"  📦 {group_name} 组最优(种子{b['seed']}) 尾箱安置台账: "
+                      f"尾箱合计={tail_total}, 已安置={placed_total}, 未安置={unplaced_total}")
+
         # discharge_spread组级汇总（所有POD×所有种子拉平算均值，不逐POD逐种子明细）
         if spread_variances:
             print(f"  📊 discharge_spread 组汇总(全部POD×全部种子, n={len(spread_variances)}): "
                   f"variance均值={np.mean(spread_variances):.3f}, "
                   f"range均值={np.mean(spread_ranges):.3f}, "
                   f"CI均值={np.mean(spread_cis):.3f}" if spread_cis else "CI均值=N/A")
-
-        # 小POD误伤诊断：只在ci_pod_enabled=True的组里有意义（False组从不调用_ci_future_pod_score）
-        if ci_pod_status:
-            triggered = _small_pod_ci_stats["triggered"]
-            total = _small_pod_ci_stats["total"]
-            print(f"  🔎 小POD(D_pod<15)触发高Cost_adj(>0.5)次数: {triggered} / 总打分次数: {total}")
 
         print("-" * 60)
 
@@ -218,7 +235,7 @@ def main():
     print(df_summary.to_string(index=False))
 
     # 你可以在这里导出最优解的 bayplan:
-    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
+    # best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
 
 if __name__ == "__main__":
     main()

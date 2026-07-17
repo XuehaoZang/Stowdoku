@@ -61,7 +61,15 @@ bay0 | bay1 | bay2 | bay3
 
 3. 基于1，引入了2个空位，在0港加入了0->4.
 
-## Run
+## Install & Run
+
 ```bash
+git clone <repo-url>
+cd Stowdoku
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
+python CSP_solver.py
 ```
+
+`pip install -e .` 会一并安装 `pyproject.toml` 中声明的依赖（pandas / numpy / matplotlib）。`data/` 和 `arxiv/` 不在 git 版本控制中，需要单独拷贝到项目根目录下。
