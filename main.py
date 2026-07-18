@@ -24,12 +24,15 @@ import pandas as pd
 
 from utils.vessel_io import (
     build_vessel_geometry, find_can_40ft, find_can_20ft, find_can_reefer,
-    batch_parse_cbf, STSE_PORT_MAP
+    batch_parse_cbf, batch_parse_cbf_with_20, STSE_PORT_MAP
 )
 from VesselClass import Vessel
 from CSP_solver import solve, reset_small_pod_ci_stats, _small_pod_ci_stats
 from utils.evaluate import evaluate_crane_time, evaluate_pod_discharge_spread
-from utils.tail import build_unified_tail_list, scan_host_candidates, match_tails_to_hosts
+from utils.tail import (
+    build_unified_tail_list, scan_host_candidates, match_tails_to_hosts,
+    build_tail_container_list, print_tail_by_port,
+)
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
 GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
@@ -37,6 +40,7 @@ GEOMETRY_DIR = "data/STSE/geometry"
 CBF_RAW_DIR = "data/STSE/raw"
 CBF_DIR = "data/STSE/cbf"
 CBF_JSON = os.path.join(CBF_DIR, "cbf.json")
+CBF_WITH_20_JSON = os.path.join(CBF_DIR, "cbf_with_20.json")
 BAYPLAN_DIR = "data/STSE/bayplan"
 
 PORT_NAMES = {v: k for k, v in STSE_PORT_MAP.items()}
@@ -60,12 +64,16 @@ def ensure_geometry() -> str:
 
 
 def ensure_cbf() -> str:
-    """确保cbf.json存在，不存在则从raw .cbf文件批量解析。返回cbf.json路径。"""
-    if os.path.exists(CBF_JSON):
-        return CBF_JSON
+    """确保cbf.json存在，不存在则从raw .cbf文件批量解析（同时顺带生成不折算20ft的cbf_with_20.json，
+    仅供核对用，不接入求解流程）。返回cbf.json路径。"""
+    if not os.path.exists(CBF_JSON):
+        batch_parse_cbf(CBF_RAW_DIR, CBF_DIR)
+        print(f"[cbf] 已构建 {CBF_JSON}")
 
-    batch_parse_cbf(CBF_RAW_DIR, CBF_DIR)
-    print(f"[cbf] 已构建 {CBF_JSON}")
+    if not os.path.exists(CBF_WITH_20_JSON):
+        batch_parse_cbf_with_20(CBF_RAW_DIR, CBF_DIR)
+        print(f"[cbf] 已构建 {CBF_WITH_20_JSON}")
+
     return CBF_JSON
 
 def main():
@@ -137,6 +145,14 @@ def main():
                 for pod_dict in result_vessel.cbf.values()
                 for counts in pod_dict.values()
             )
+            # 注意：这只是vessel.cbf的原始残量(旧口径的"来源1")，不含deck-squeeze
+            # 或HC/RF预算池分不完的部分，比真实尾箱数偏小很多；这里只是每个种子
+            # 都要跑一遍的快速信号(用来在打印/mean-var统计里粗略比较不同种子)，
+            # 不追求精确，也不参与best_record_for_group的选优标准(选优用的是
+            # total_voyage_time)。真正准确、跟build_tail_container_list("最终结果
+            # vs 原始demand"一次性比较，见utils/tail.py)对得上的尾箱数字，
+            # 只在下面"组最优"那一段对best_vessel_for_group单独跑一次
+            # (跑一次全船proj_cell_to_vessel的成本，不值得在每个种子上都付一遍)。
 
             total_voyage_time = 0.0
             total_wait_time = 0.0
@@ -217,8 +233,25 @@ def main():
                 tail_total = sum(rec["count"] for rec in unified_tail_list)
                 placed_total = sum(p["count"] for p in placements)
                 unplaced_total = sum(u["count"] for u in unplaced)
-                print(f"  📦 {group_name} 组最优(种子{b['seed']}) 尾箱安置台账: "
+                print(f"  📦 {group_name} 组最优(种子{b['seed']}) 尾箱安置台账(旧口径): "
                       f"尾箱合计={tail_total}, 已安置={placed_total}, 未安置={unplaced_total}")
+
+                # 新口径("最终结果 vs 原始demand"一次性比较，见utils/tail.py
+                # build_tail_container_list docstring)：跟旧口径(来源1+2+3独立
+                # 相加)算的是同一件事的两种口径，先并排打印做对比观察，不直接
+                # 替换旧口径的安置流程(unified_tail_list仍然是喂给
+                # match_tails_to_hosts的那份)——等确认新口径在这份真实数据上
+                # 稳定可信后，再考虑把上面的unified_tail_list换成new_tail_list。
+                new_tail_list = build_tail_container_list(
+                    best_vessel_for_group, best_snapshots, original_cbf
+                )
+                new_tail_total = sum(rec["count"] for rec in new_tail_list)
+                print(f"  📦 {group_name} 组最优(种子{b['seed']}) 尾箱统计(新口径): "
+                      f"尾箱合计={new_tail_total} (旧口径={tail_total}, "
+                      f"差异={new_tail_total - tail_total:+d})")
+
+                print_tail_by_port(new_tail_list, original_cbf, port_names=PORT_NAMES, label="新口径")
+                print_tail_by_port(unified_tail_list, original_cbf, port_names=PORT_NAMES, label="旧口径")
 
         # discharge_spread组级汇总（所有POD×所有种子拉平算均值，不逐POD逐种子明细）
         if spread_variances:
@@ -235,7 +268,7 @@ def main():
     print(df_summary.to_string(index=False))
 
     # 你可以在这里导出最优解的 bayplan:
-    # best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
+    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
 
 if __name__ == "__main__":
     main()

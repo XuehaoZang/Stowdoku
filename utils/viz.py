@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from utils.vessel_io import STSE_BAY_PAIRS
 
-plt.rcParams['font.sans-serif'] = ['SimHei']  # Use a font that supports Chinese characters
+plt.rcParams['font.sans-serif'] = ['PingFang SC', 'SimHei'] # Use a font that supports Chinese characters
 plt.rcParams['axes.unicode_minus'] = False     # Fixes minus sign rendering issues
 plt.rcParams['mathtext.fontset'] = 'cm'
 

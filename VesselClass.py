@@ -29,7 +29,7 @@ class Vessel:
     # 不能用np.full(shape, {...})批量填充——那样所有cell会共享同一个dict对象，
     # 改一个牵动全部。__init__里逐个构造。
 
-    def __init__(self, full_slot_table: pd.DataFrame, cbf: dict, current_pol: int = 0, tail_threshold: int = 5):
+    def __init__(self, full_slot_table: pd.DataFrame, cbf: dict, current_pol: int = 0, tail_threshold: int = 4):
         if full_slot_table is None:
             raise ValueError("full_slot_table 不能为空")
         if cbf is None:
@@ -162,16 +162,19 @@ class Vessel:
         return cls(full_slot_table=slots, cbf=cbf, current_pol=current_pol)
 
     @staticmethod
-    def _stack_hc_cap(n: int, hd: int) -> int:
+    def _stack_hc_cap(n: int, hd: int = None) -> int:
         """
-        一摞(同一row_idx方向叠放的can_40ft槽位集合)的HC容量上限，
+        一摞(同一row_idx方向叠放的can_40ft槽位集合)的HC配额quota(n)，
         _derive_capacity_hc(静态capacity_hc)和proj_cell_to_vessel(实际贴标签时
-        的stack_hc_remaining)都要用同一条公式，抽在这里只维护一份：
-            hold(hd=0): 纯配额 min(n, 2)
-            deck(hd=1): 阶跃式 n - 1（这一摞只要出现>=1个HC，占用数就从n降到
-                        n-1，不随HC数量继续增加而继续扣，n=这一摞的can_40ft槽位数）
+        按摞贪心分配)都要用同一条公式，抽在这里只维护一份：
+            quota(n) = n - 1 （n >= 2）
+            quota(n) = 1     （n == 1）
+        hold和deck共用同一公式，不再区分两级配额；hd参数只为兼容旧调用签名保留，
+        不参与计算。
         """
-        return min(n, 2) if hd == 0 else max(n - 1, 0)
+        if n <= 0:
+            return 0
+        return n - 1 if n >= 2 else 1
 
     @staticmethod
     def _derive_capacity_hc(slots: pd.DataFrame) -> np.ndarray:
@@ -433,9 +436,24 @@ class Vessel:
         第二步（贴HC标签）：预算池按(POL,POD)粒度，取original_cbf里这个POL/POD
         的原始HC/HR总demand（不用record["_gp_from_hc"]/["_rf_from_hr"]——那两个
         只是assign()记账顺序的副产品，只服务unassign()回滚，不代表这个cell该
-        负责发多少高箱名额）。同一个POD占用的所有cell共享同一个预算池，按cell的
-        capacity_hc降序依次分配；cell内部仍按摞（capacity_hc_stack降序、从下往上）
-        贴标。预算池最终分不完的部分，回退进cbf余量。
+        负责发多少高箱名额）。RF预算(rf_hc_budget)和GP预算(gp_hc_budget)分开走，
+        但共享同一套摞级配额quota(n)（_stack_hc_cap，hold/deck统一公式）和同一个
+        occupied集合判断逻辑，贴标顺序沿用先RF后GP。按(POL,POD)分组后，把该组
+        占用的所有摞（跨host cell合并）按hd拆成hold摞/deck摞两批，分四步分配：
+            Step1（hold）：所有hold摞按quota(n)降序贪心贴标，每摞最多贴quota(n)个，
+                不要求整摞同质（quota个高箱+其余普箱共存）。
+            Step2（deck）：所有deck摞按quota(n)降序贪心处理。若当前预算能覆盖
+                这一摞的整个quota(n)，则整摞转HC：贴满quota(n)个高箱；若这一摞
+                贴标前是摆满的(occupied==n)，把多出的1个slot(tier_idx最大)腾空，
+                对应demand按GP回退回cbf余量。若预算不足以覆盖整摞quota(n)但仍>0，
+                视为"收尾摞"：贴min(预算,quota(n))个高箱，其余slot维持原样的
+                GP/RF（不腾空、不退回），预算清零后立即停止处理后续deck摞——
+                这种收尾摞混装每个(POL,POD)分组最多发生一次。
+            Step3（hold二次扫描）：Step1+Step2跑完后预算仍>0，回到hold摞（跳过
+                Step1已贴满quota上限的摞），套用跟Step2收尾摞相同的规则继续贴，
+                直到预算耗尽或hold摞用尽（不限次数，不要求GP需求为0才触发）。
+            Step4：分不完的gp_hc_budget/rf_hc_budget回退进cbf余量。
+        排序用贪心（quota(n)降序），不做背包最优匹配。
         """
         if self.full_slot_table is None:
             raise ValueError("此Vessel无full_slot_table，无法投影，需通过Vessel.load_vessel()构造")
@@ -540,7 +558,7 @@ class Vessel:
                             else:
                                 slots.at[idx, "GP_count"] = 1
 
-        # 第二步：贴HC标签 + 降级回退，按(POL,POD)共享预算池，cell按capacity_hc降序分配。
+        # 第二步：贴HC标签 + 降级回退，按(POL,POD)分组，摞(row)级四步分配（见上方docstring）。
         pod_groups = {}
         for info in cell_infos:
             pod_groups.setdefault((info["pol"], info["pod"]), []).append(info)
@@ -554,94 +572,229 @@ class Vessel:
             demand = original_cbf.get(pol, {}).get(pod, {})
             gp_hc_budget = demand.get("HC", 0)
             rf_hc_budget = demand.get("HR", 0)
+            # 真GP预算池：取original_cbf的原始"GP"字段本身(不是GP+HC合并值)，
+            # 跟gp_hc_budget/rf_hc_budget一样是这个(POL,POD)分组共享、贯穿
+            # 所有hold/deck摞的池子，专门核对"贴完HC quota之后剩下的slot"。
+            gp_true_budget = demand.get("GP", 0)
+            # 真RF预算池：跟gp_true_budget完全对称，取original_cbf的原始
+            # "RF"字段本身，核对reefer摞里"贴完HC quota之后剩下的slot"该留
+            # 真RF还是该清空退回HR借位。
+            rf_true_budget = demand.get("RF", 0)
 
-            infos.sort(key=lambda info: info["cap_hc"], reverse=True)
-
+            # 把该分组占用的所有摞（跨host cell合并）按hd拆成hold摞/deck摞两批。
+            hold_stacks, deck_stacks = [], []
             for info in infos:
-                row_groups = info["row_groups"]
-                row_order = info["row_order"]
-                stack_hc_remaining = info["stack_hc_remaining"]
-                used_rf_set = info["used_rf_set"]
-                used_gp_set = info["used_gp_set"]
-                hc_tagged_idx = set()
+                for row_idx, idx_list in info["row_groups"].items():
+                    n = len(idx_list)
+                    stack = {
+                        "info": info, "idx_list": idx_list,
+                        "quota": self._stack_hc_cap(n),
+                        "used_rf": [idx for idx in idx_list if idx in info["used_rf_set"]],
+                        "used_gp": [idx for idx in idx_list if idx in info["used_gp_set"]],
+                        "hc_tagged": set(),
+                    }
+                    (hold_stacks if info["hd"] == 0 else deck_stacks).append(stack)
 
-                for row_idx in row_order:
-                    if rf_hc_budget <= 0:
-                        break
-                    occupied_rf_in_stack = [idx for idx in row_groups[row_idx] if idx in used_rf_set]
-                    take = min(stack_hc_remaining[row_idx], len(occupied_rf_in_stack), rf_hc_budget)
-                    for idx in occupied_rf_in_stack[:take]:
-                        slots.at[idx, "is_hc"] = True
-                        hc_tagged_idx.add(idx)
-                    stack_hc_remaining[row_idx] -= take
-                    rf_hc_budget -= take
+            hold_stacks.sort(key=lambda s: s["quota"], reverse=True)
+            deck_stacks.sort(key=lambda s: s["quota"], reverse=True)
 
-                for row_idx in row_order:
-                    if gp_hc_budget <= 0:
-                        break
-                    occupied_gp_in_stack = [
-                        idx for idx in row_groups[row_idx]
-                        if idx in used_gp_set and idx not in hc_tagged_idx
-                    ]
-                    take = min(stack_hc_remaining[row_idx], len(occupied_gp_in_stack), gp_hc_budget)
-                    for idx in occupied_gp_in_stack[:take]:
-                        slots.at[idx, "is_hc"] = True
-                        hc_tagged_idx.add(idx)
-                    stack_hc_remaining[row_idx] -= take
-                    gp_hc_budget -= take
+            def _tag_stack(stack, cap):
+                """在这一摞里最多贴cap个高箱标签（先RF后GP，各自受各自预算池和
+                自身occupied集合限制），就地更新is_hc/stack["hc_tagged"]和
+                外层rf_hc_budget/gp_hc_budget，返回本次实际贴的数量。"""
+                nonlocal rf_hc_budget, gp_hc_budget
+                remaining_cap = cap
 
-                if not hc_tagged_idx:
+                rf_untagged = [idx for idx in stack["used_rf"] if idx not in stack["hc_tagged"]]
+                take_rf = min(remaining_cap, len(rf_untagged), rf_hc_budget)
+                for idx in rf_untagged[:take_rf]:
+                    slots.at[idx, "is_hc"] = True
+                    stack["hc_tagged"].add(idx)
+                rf_hc_budget -= take_rf
+                remaining_cap -= take_rf
+
+                gp_untagged = [idx for idx in stack["used_gp"] if idx not in stack["hc_tagged"]]
+                take_gp = min(remaining_cap, len(gp_untagged), gp_hc_budget)
+                for idx in gp_untagged[:take_gp]:
+                    slots.at[idx, "is_hc"] = True
+                    stack["hc_tagged"].add(idx)
+                gp_hc_budget -= take_gp
+
+                return take_rf + take_gp
+
+            def _settle_leftover_gp(stack):
+                """贴完这一摞的HC quota后，摞里剩下没被贴上HC标签的GP槽位，
+                逐个核对gp_true_budget：预算>0则消耗1个、合法保留为真GP；
+                预算==0说明这个slot的真实身份其实是HC借位(不是真GP)，就地
+                物理清空(POD/POL/GP_count/RF_count/is_hc全部重置)，并把1
+                单位退回self.cbf[pol][pod]["HC"]（不是"GP"）。清空的slot从
+                stack["used_gp"]里移除，避免后续(Step3二次扫描)把一个已经
+                物理清空的slot误当成可贴HC标签的候选。
+
+                gp_hc_budget/rf_hc_budget在整个(POL,POD)分组的处理过程中只
+                会单调递减、不会回补，所以一个摞在被Step1/Step2/Step3任一步
+                实际处理(调用过_tag_stack)之后，它当下没被贴上HC标签的occupied
+                slot就已经是最终结果——不会有"budget后来又变宽裕了"的情况，
+                可以立即结算，不需要等所有step跑完再统一处理。"""
+                nonlocal gp_true_budget
+                leftover = [idx for idx in stack["used_gp"] if idx not in stack["hc_tagged"]]
+                for idx in leftover:
+                    if gp_true_budget > 0:
+                        gp_true_budget -= 1
+                        continue
+                    b1 = stack["info"]["b1"]
+                    release_row = slots.at[idx, "row_idx"]
+                    release_tier = slots.at[idx, "tier_idx"]
+                    for target_idx in [idx] + list(slots.index[
+                        (slots.bay_idx == b1)
+                        & (slots.row_idx == release_row)
+                        & (slots.tier_idx == release_tier)
+                    ]):
+                        slots.at[target_idx, "POL"] = -1
+                        slots.at[target_idx, "POD"] = -1
+                        slots.at[target_idx, "GP_count"] = 0
+                        slots.at[target_idx, "RF_count"] = 0
+                        slots.at[target_idx, "is_hc"] = False
+                    stack["used_gp"].remove(idx)
+                    if not already_written:
+                        cbf_demand = self.cbf[pol][pod]
+                        cbf_demand["HC"] = cbf_demand.get("HC", 0) + 1
+
+            def _settle_leftover_rf(stack):
+                """跟_settle_leftover_gp完全对称，只是对象换成reefer摞里没被
+                贴上HC标签的RF槽位，预算池换成rf_true_budget，退回目标换成
+                self.cbf[pol][pod]["HR"]（这个slot的真实身份是HR借reefer
+                占位，不是真RF）。"""
+                nonlocal rf_true_budget
+                leftover = [idx for idx in stack["used_rf"] if idx not in stack["hc_tagged"]]
+                for idx in leftover:
+                    if rf_true_budget > 0:
+                        rf_true_budget -= 1
+                        continue
+                    b1 = stack["info"]["b1"]
+                    release_row = slots.at[idx, "row_idx"]
+                    release_tier = slots.at[idx, "tier_idx"]
+                    for target_idx in [idx] + list(slots.index[
+                        (slots.bay_idx == b1)
+                        & (slots.row_idx == release_row)
+                        & (slots.tier_idx == release_tier)
+                    ]):
+                        slots.at[target_idx, "POL"] = -1
+                        slots.at[target_idx, "POD"] = -1
+                        slots.at[target_idx, "GP_count"] = 0
+                        slots.at[target_idx, "RF_count"] = 0
+                        slots.at[target_idx, "is_hc"] = False
+                    stack["used_rf"].remove(idx)
+                    if not already_written:
+                        cbf_demand = self.cbf[pol][pod]
+                        cbf_demand["HR"] = cbf_demand.get("HR", 0) + 1
+
+            # ── Step1：hold摞，按quota(n)降序贪心，每摞最多贴quota(n)个。
+            # 结算gp_true_budget不受"两个HC/RF预算池是否已耗尽"这个提前退出
+            # 条件限制——budget只降不升，一旦耗尽，后面没被_tag_stack碰到的
+            # hold摞里的GP也永远不会再有机会被贴成HC，同样需要立即结算，
+            # 否则会在耗尽点之后残留大量"名义是GP、实际没被gp_true_budget
+            # 核销"的phantom GP。──
+            for stack in hold_stacks:
+                if not (rf_hc_budget <= 0 and gp_hc_budget <= 0):
+                    _tag_stack(stack, stack["quota"])
+                _settle_leftover_gp(stack)
+                _settle_leftover_rf(stack)
+
+            # ── Step2：deck摞，按quota(n)降序，整摞转HC(预算够)或收尾摞混装(不够，
+            # 只允许触发一次)。"只允许触发一次"只约束贴HC标签这个动作——
+            # deck_tail_used置位之后不再尝试贴标签，但每一摞(包括被跳过贴标签
+            # 的)仍然要走gp_true_budget结算，否则quota之外/被跳过的deck摞会
+            # 残留大量没被gp_true_budget核销的phantom GP ──
+            deck_tail_used = False
+            for stack in deck_stacks:
+                quota = stack["quota"]
+                if not deck_tail_used and not (rf_hc_budget <= 0 and gp_hc_budget <= 0):
+                    # 前置判断：不实际贴标，先算这一摞当前的occupied+预算最多能贴满
+                    # 多少个，判断是否够覆盖整摞quota(n)。
+                    rf_avail = len([idx for idx in stack["used_rf"] if idx not in stack["hc_tagged"]])
+                    gp_avail = len([idx for idx in stack["used_gp"] if idx not in stack["hc_tagged"]])
+                    take_rf_sim = min(quota, rf_avail, rf_hc_budget)
+                    take_gp_sim = min(quota - take_rf_sim, gp_avail, gp_hc_budget)
+                    achievable = take_rf_sim + take_gp_sim
+
+                    if achievable >= quota:
+                        # 整摞转HC：贴满quota(n)个高箱。deck摞的HC是阶跃式扣减：
+                        # 这一摞贴标签前如果是摆满的(occupied==n)，就要把这一摞里
+                        # tier_idx最大(最后摆放)的那个占用槽位腾空，对应demand
+                        # 按GP回退回cbf余量；如果贴标签前本就不满(occupied==quota)，
+                        # 则不需要腾空。
+                        _tag_stack(stack, quota)
+
+                        n = len(stack["idx_list"])
+                        occupied = len(stack["used_rf"]) + len(stack["used_gp"])
+                        if occupied == n:
+                            idx_release = stack["idx_list"][-1]
+                            release_row = slots.at[idx_release, "row_idx"]
+                            release_tier = slots.at[idx_release, "tier_idx"]
+                            b1 = stack["info"]["b1"]
+
+                            # print(f"[尾箱来源2] deck摞腾空回退触发: POL={pol}, POD={pod}, 数量=1")
+                            self._tail_source2_log.append((pol, pod))
+
+                            for target_idx in [idx_release] + list(slots.index[
+                                (slots.bay_idx == b1)
+                                & (slots.row_idx == release_row)
+                                & (slots.tier_idx == release_tier)
+                            ]):
+                                slots.at[target_idx, "POL"] = -1
+                                slots.at[target_idx, "POD"] = -1
+                                slots.at[target_idx, "GP_count"] = 0
+                                slots.at[target_idx, "RF_count"] = 0
+                                slots.at[target_idx, "is_hc"] = False
+                            # idx_release已经被这里的腾空+GP回退处理过，若它属于
+                            # used_gp/used_rf，必须从列表里摘除，避免下面
+                            # _settle_leftover_gp/_settle_leftover_rf把同一个
+                            # 已清空的slot再核销一次(GP/RF和HC/HR重复回退)。
+                            if idx_release in stack["used_gp"]:
+                                stack["used_gp"].remove(idx_release)
+                            if idx_release in stack["used_rf"]:
+                                stack["used_rf"].remove(idx_release)
+
+                            if not already_written:
+                                cbf_demand = self.cbf[pol][pod]
+                                cbf_demand["GP"] = cbf_demand.get("GP", 0) + 1
+                    elif achievable > 0:
+                        # 收尾摞混装：贴min(预算,quota(n))个高箱，其余occupied slot
+                        # 交给下面的gp_true_budget结算决定去留。预算清零后不再对
+                        # 后续deck摞尝试贴标签——每个(POL,POD)分组最多发生一次。
+                        _tag_stack(stack, quota)
+                        deck_tail_used = True
+
+                _settle_leftover_gp(stack)
+                _settle_leftover_rf(stack)
+
+            # ── Step3：预算仍有剩余，回到hold摞二次扫描（跳过Step1已贴满quota
+            # 上限的摞），套用跟Step2收尾摞相同的规则继续贴，不限次数，直到
+            # 预算耗尽或hold摞用尽 ──
+            for stack in hold_stacks:
+                if rf_hc_budget <= 0 and gp_hc_budget <= 0:
+                    break
+                remaining_quota = stack["quota"] - len(stack["hc_tagged"])
+                if remaining_quota <= 0:
                     continue
+                _tag_stack(stack, remaining_quota)
+                _settle_leftover_gp(stack)
+                _settle_leftover_rf(stack)
 
-                # b1侧：镜像is_hc标签，(row_idx,tier_idx)与b0侧完全一致
-                b1 = info["b1"]
+            # b1侧：镜像is_hc标签，(row_idx,tier_idx)与b0侧完全一致
+            for stack in hold_stacks + deck_stacks:
+                if not stack["hc_tagged"]:
+                    continue
+                b1 = stack["info"]["b1"]
                 rt_hc = {
                     (slots.at[idx, "row_idx"], slots.at[idx, "tier_idx"])
-                    for idx in hc_tagged_idx
+                    for idx in stack["hc_tagged"]
                 }
                 for idx in slots.index[slots.bay_idx == b1]:
                     key = (slots.at[idx, "row_idx"], slots.at[idx, "tier_idx"])
                     if key in rt_hc:
                         slots.at[idx, "is_hc"] = True
-
-                # deck摞的HC是阶跃式扣减：这一摞只要出现>=1个HC，总占用数就要
-                # 从n降到n-1（不管贴了几个HC），跟hold摞的纯配额min(n,2)不同。
-                # 如果这一摞贴标签前是摆满的(occupied==n)，就要把这一摞里
-                # tier_idx最大(最后摆放)的那个占用槽位腾空，对应的demand按GP
-                # 回退回cbf余量。
-                if info["hd"] == 1:
-                    used_rf_set = info["used_rf_set"]
-                    used_gp_set = info["used_gp_set"]
-                    idx_to_row = {idx: r for r, idxs in row_groups.items() for idx in idxs}
-                    rows_with_hc = {idx_to_row[idx] for idx in hc_tagged_idx}
-                    for row_idx in rows_with_hc:
-                        idxs = row_groups[row_idx]
-                        n = len(idxs)
-                        occupied = sum(1 for idx in idxs if idx in used_rf_set or idx in used_gp_set)
-                        if occupied != n:
-                            continue
-
-                        idx_release = idxs[-1]
-                        release_row = slots.at[idx_release, "row_idx"]
-                        release_tier = slots.at[idx_release, "tier_idx"]
-
-                        # print(f"[尾箱来源2] deck摞腾空回退触发: POL={pol}, POD={pod}, 数量=1")
-                        self._tail_source2_log.append((pol, pod))
-
-                        for target_idx in [idx_release] + list(slots.index[
-                            (slots.bay_idx == b1)
-                            & (slots.row_idx == release_row)
-                            & (slots.tier_idx == release_tier)
-                        ]):
-                            slots.at[target_idx, "POL"] = -1
-                            slots.at[target_idx, "POD"] = -1
-                            slots.at[target_idx, "GP_count"] = 0
-                            slots.at[target_idx, "RF_count"] = 0
-                            slots.at[target_idx, "is_hc"] = False
-
-                        if not already_written:
-                            cbf_demand = self.cbf[pol][pod]
-                            cbf_demand["GP"] = cbf_demand.get("GP", 0) + 1
 
             if gp_hc_budget > 0 or rf_hc_budget > 0:
                 # 预算池分不完——跟deck-squeeze一样是幂等的计算结果，每次

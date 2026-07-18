@@ -11,7 +11,10 @@
       "Bash(./.venv/Scripts/python.exe -m py_compile CSP_solver.py main.py VesselClass.py utils/evaluate.py)",
       "Bash(python -c \"import VesselClass\")",
       "Bash(./.venv/Scripts/python.exe -m py_compile utils/evaluate.py)",
-      "Bash(./.venv/Scripts/python.exe -m py_compile CSP_solver.py)"
+      "Bash(./.venv/Scripts/python.exe -m py_compile CSP_solver.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('VesselClass.py'\\).read\\(\\)\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(git stash *)"
     ],
     "additionalDirectories": [
       "\\tmp"

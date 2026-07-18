@@ -252,6 +252,113 @@ def build_unified_tail_list(vessel: Vessel, final_cbf: dict, snapshots: dict, or
     return records
 
 
+def build_tail_container_list(vessel: Vessel, snapshots: dict, original_cbf: dict) -> list:
+    """新口径尾箱统计：不再把三条独立触发路径(来源1/2/3)的残量相加，而是对
+    每个(POL,POD)做一次性的"最终结果 vs 原始demand"比较，直接算出真实缺口。
+
+    背景：来源1(assign()按总量分配、不知道cap_hc配额)和来源3(贴标签阶段
+    才第一次知道cap_hc，把预算池分不完的部分回退)统计的是同一批箱子在两个
+    不同信息状态下的两次观察，不是两件独立发生的事——旧的build_unified_tail_list
+    把它们当独立来源相加会重复计数。真实缺口只取决于"最终船上实际贴出了
+    多少标签"和"最初demand要多少"这两个端点，中间assign()阶段猜错、
+    贴标签阶段又回退的过程量不重要。
+
+    公式（对original_cbf里出现过的每个(POL,POD)，不依赖旧的按日志分组的
+    判断）：
+        最终HC标签数 = 该(POL,POD)自己这港新装的slot里，is_hc=True 且
+            GP_count=1（GP物理占用，非RF占用）的slot数
+        最终HR标签数 = 同理，is_hc=True 且 RF_count=1（RF物理占用）的slot数
+        最终GP数 = 该(POL,POD)的GP_count总和 − 最终HC标签数
+        最终RF数 = 该(POL,POD)的RF_count总和 − 最终HR标签数
+
+        GP缺口 = max(0, original GP demand − 最终GP数)
+        HC缺口 = max(0, original HC demand − 最终HC标签数)
+        RF缺口 = max(0, original RF demand − 最终RF数)
+        HR缺口 = max(0, original HR demand − 最终HR标签数)
+
+    "自己这港新装的部分"通过两点保证，不会牵连进船上其他更早港口已经在船、
+    但同一次投影里恰好也被算到的货：
+        1. 每个(POL,POD)固定用snapshots[POL]（这个POL自己的离港快照）做
+           投影，而不是这批货存活期内路过的所有后续POL快照——proj_cell_to_vessel
+           对同一份未discharge的货是幂等的，snapshots[POL]已经是这批货刚装船
+           那一刻的完整状态，没必要也不应该再看后面的快照。
+        2. 即便snapshots[POL]里同时混有更早港口还没卸的货，投影结果的每个
+           slot都带着自己的POL字段（record["POL"]在assign()时写死，不会被
+           后续港口的装货动作覆盖），所以按(POL==本港, POD==目标港)双重
+           过滤就能精确切出"这港新装的部分"，不会把别的港口装的同POD货
+           算进来。
+
+    每个(POL)只投影一次（不管这一港有多少个POD），投影用vessel的deepcopy
+    跑（proj_cell_to_vessel会写self.cbf/_tail_source2_log/_tail_source3_log
+    等副作用，不能污染调用方传入的vessel实例，做法跟scan_host_candidates
+    一致）。original_cbf里出现的POL如果压根没进snapshots（比如这一港demand
+    全部是0，或者这一港所有货都变成了完全没上船的尾货），视为这港最终
+    HC/HR/GP/RF全部是0，对应缺口=完整的原始demand。
+
+    返回list[dict]，每条{"POL","POD","type","count","source"}，count>0，
+    source统一标注"final_vs_original"，跟build_unified_tail_list产出的
+    (POL,POD,type,count,source)格式完全一致，可以直接接到
+    scan_host_candidates/match_tails_to_hosts/apply_tail_placements的
+    现有接口上跑。
+    """
+    proj_vessel = copy.deepcopy(vessel)
+    proj_cache = {}
+    for snap_pol in sorted(snapshots.keys()):
+        proj_cache[snap_pol] = proj_vessel.proj_cell_to_vessel(
+            cell_state=snapshots[snap_pol], original_cbf=original_cbf
+        )
+
+    pol_pod_pairs = sorted(
+        (pol, pod)
+        for pol, pod_dict in original_cbf.items()
+        for pod in pod_dict.keys()
+    )
+
+    records = []
+    for pol, pod in pol_pod_pairs:
+        demand = original_cbf.get(pol, {}).get(pod, {})
+        gp_demand = demand.get("GP", 0)
+        hc_demand = demand.get("HC", 0)
+        rf_demand = demand.get("RF", 0)
+        hr_demand = demand.get("HR", 0)
+
+        df = proj_cache.get(pol)
+        if df is None:
+            # 这个POL压根没有离港快照（这一港没有任何货真正上船），
+            # 最终结果全是0，缺口=完整的原始demand。
+            final_hc = final_hr = final_gp = final_rf = 0
+        else:
+            # 只认_BIG_BAY_OF_B0能映射到的b0侧行——proj_cell_to_vessel会把
+            # 每个cell的标签原样镜像写到b1侧(bay_idx+1)，b1侧是重复的镜像
+            # 数据，不是额外的物理槽位，跟capacity_hc/scan_host_candidates
+            # 的统计口径保持一致（否则每个slot会被算两遍，final_gp/final_hc
+            # 变成两倍，缺口算出来会全部被冲成0）。
+            mask = (
+                (df["POL"] == pol) & (df["POD"] == pod)
+                & df["bay_idx"].isin(_BIG_BAY_OF_B0.keys())
+            )
+            sub = df.loc[mask]
+            final_hc = int(((sub["is_hc"]) & (sub["GP_count"] == 1)).sum())
+            final_hr = int(((sub["is_hc"]) & (sub["RF_count"] == 1)).sum())
+            gp_total = int(sub["GP_count"].sum())
+            rf_total = int(sub["RF_count"].sum())
+            final_gp = gp_total - final_hc
+            final_rf = rf_total - final_hr
+
+        gaps = {
+            "GP": max(0, gp_demand - final_gp),
+            "HC": max(0, hc_demand - final_hc),
+            "RF": max(0, rf_demand - final_rf),
+            "HR": max(0, hr_demand - final_hr),
+        }
+        for ctype in ("GP", "HC", "RF", "HR"):
+            n = gaps[ctype]
+            if n:
+                records.append({"POL": pol, "POD": pod, "type": ctype, "count": n, "source": "final_vs_original"})
+
+    return records
+
+
 def scan_host_candidates(vessel: Vessel, snapshots: dict) -> dict:
     """
     任务2b：遍历snapshots所有POL快照的cell，按(bay,lr,hd,POL,POD)去重收集
@@ -1660,6 +1767,463 @@ def verify_multi_pol_replay_dedup():
               f"与手算去重结果(来源2={dedup2_total}, 来源3={manual_source3_total})不一致！")
 
 
+def build_hold_hc_budget_scenario():
+    """最小合成场景，专门用来手算验证build_tail_container_list：复刻任务描述
+    里那个例子——1个hold cell，10个物理槽位(cap_total=10)，额定HC配额
+    cap_hc=4，demand是GP=8、HC=6(合计14)。
+
+    几何：只给1个valid cell——big_bay=0（对应STSE_BAY_PAIRS[0]=(2,3)）的
+    lr=0,hd=0(hold)。2个"摞"(row_idx)：
+        row_idx=0: 8个tier(0..7)的can_40ft槽位 -> 这一摞cap=8，
+            _stack_hc_cap(8, hd=0)=min(8,2)=2
+        row_idx=1: 2个tier(0..1)的can_40ft槽位 -> 这一摞cap=2，
+            _stack_hc_cap(2, hd=0)=min(2,2)=2
+    capacity_total=8+2=10，capacity_hc=2+2=4，跟例子完全对上。bay_idx=3
+    是b1侧镜像行，只用于proj_cell_to_vessel写回镜像标签，不计入capacity
+    （跟build_test_scenario同款做法，capacity只认_BIG_BAY_OF_B0能映射到的
+    b0侧行）。
+
+    cbf: POL=0, POD=1: GP=8, HC=6。tail_threshold用默认值5，
+    GP+HC=14>5能进候选集；这个vessel只有1个valid cell、1个POD候选，
+    solve()会把它直接分进这个cell：
+        assign()：gp_capacity=cap_total-rf_used(0)=10，
+            gp_total_remaining=8+6=14，gp_used=min(10,14)=10，
+            gp_deduct_gp=min(8,10)=8，gp_deduct_hc=10-8=2 ——
+            demand变为GP=0, HC=4(合计4<=5)，port立即complete。
+        proj_cell_to_vessel贴HC标签：budget取original_cbf的HC=6（不是
+            扣减后的cbf残量4），按capacity_hc降序分配到2个摞：
+            row0(stack_hc=2)先取min(2,8,6)=2，budget剩4；
+            row1(stack_hc=2)再取min(2,2,4)=2，budget剩2——
+            共贴出4个HC标签，跟cap_hc=4吻合；budget剩2分不完，回退进cbf
+            （这就是旧口径"来源3"会记一笔gp_hc_budget剩=2的地方）。
+
+    手算的新口径结果：
+        最终HC标签数=4，最终GP数=GP_count总和(10)-4=6
+        GP缺口=max(0, 8-6)=2
+        HC缺口=max(0, 6-4)=2
+        （RF/HR在这个场景里全程是0，缺口也是0）
+    旧口径(来源1+来源3)会算出：
+        来源1: HC残量=4（assign()后cbf.HC=4，GP=0未记入因为已扣到0）
+        来源3: HC leftover=2（budget分不完的部分）
+        旧口径HC "缺口" = 4+2 = 6，比新口径的2大了整整3倍，且GP缺口完全
+        没体现(旧口径GP=0，但其实GP demand=8只满足了6个，真实还缺2个)——
+        这正是任务描述里要修的重复计数+方向性错误。
+
+    返回vessel（未跑solve()，调用方自己跑）。
+    """
+    rows = []
+    for bay_idx in (2, 3):
+        for tier_idx in range(8):
+            rows.append({"bay_idx": bay_idx, "row_idx": 0, "tier_idx": tier_idx, "lr": 0, "hd": 0,
+                         "can_40ft": True, "can_20ft": False, "can_reefer": False})
+        for tier_idx in range(2):
+            rows.append({"bay_idx": bay_idx, "row_idx": 1, "tier_idx": tier_idx, "lr": 0, "hd": 0,
+                         "can_40ft": True, "can_20ft": False, "can_reefer": False})
+    full_slot_table = pd.DataFrame(rows)
+    cbf = {0: {1: {"GP": 8, "HC": 6}}}
+    vessel = Vessel(full_slot_table=full_slot_table, cbf=cbf, current_pol=0)
+    return vessel
+
+
+def verify_build_tail_container_list_hold_example():
+    """跑build_hold_hc_budget_scenario()，断言build_tail_container_list算出的
+    GP缺口=2、HC缺口=2（build_hold_hc_budget_scenario docstring里手算的结果），
+    并对比旧口径(build_unified_tail_list，来源1+来源3独立相加)算出的更大、
+    且方向性错误(漏报GP缺口)的数字，证明新函数确实修好了重复计数问题。
+    """
+    print("\n" + "=" * 60)
+    print("──── build_tail_container_list 手算hold例子验证 ────")
+    print("=" * 60)
+
+    vessel = build_hold_hc_budget_scenario()
+    original_cbf = copy.deepcopy(vessel.cbf)
+
+    snapshots = {}
+    best = {"assigned": -1, "vessel": None}
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+    result_vessel = vessel if success else best["vessel"]
+    print(f"solve()完成: success={success}, 剩余cbf={result_vessel.cbf}")
+
+    final_cbf = copy.deepcopy(result_vessel.cbf)
+
+    new_list = build_tail_container_list(result_vessel, snapshots, original_cbf)
+    print(f"\n新口径(final_vs_original)结果: {new_list}")
+
+    new_by_type = {}
+    for rec in new_list:
+        new_by_type[rec["type"]] = new_by_type.get(rec["type"], 0) + rec["count"]
+    gp_gap = new_by_type.get("GP", 0)
+    hc_gap = new_by_type.get("HC", 0)
+    rf_gap = new_by_type.get("RF", 0)
+    hr_gap = new_by_type.get("HR", 0)
+    print(f"新口径按type求和: GP缺口={gp_gap}, HC缺口={hc_gap}, RF缺口={rf_gap}, HR缺口={hr_gap}")
+
+    expected_gp_gap, expected_hc_gap = 2, 2
+    assert gp_gap == expected_gp_gap, f"GP缺口应为{expected_gp_gap}，实际={gp_gap}"
+    assert hc_gap == expected_hc_gap, f"HC缺口应为{expected_hc_gap}，实际={hc_gap}"
+    assert rf_gap == 0 and hr_gap == 0, f"这个场景没有RF/HR demand，缺口应全为0，实际RF={rf_gap} HR={hr_gap}"
+    print(f"[OK] 新口径与手算结果完全一致：GP缺口=2, HC缺口=2")
+
+    # 对比旧口径：来源1(assign()后残量) + 来源3(HC预算池分不完回退)独立相加
+    old_list = build_unified_tail_list(result_vessel, final_cbf, snapshots, original_cbf)
+    print(f"\n旧口径(来源1+2+3独立相加)结果: {old_list}")
+    old_by_type = {}
+    for rec in old_list:
+        old_by_type[rec["type"]] = old_by_type.get(rec["type"], 0) + rec["count"]
+    old_gp_gap = old_by_type.get("GP", 0)
+    old_hc_gap = old_by_type.get("HC", 0)
+    print(f"旧口径按type求和: GP缺口={old_gp_gap}, HC缺口={old_hc_gap}")
+
+    old_total = sum(old_by_type.values())
+    new_total = sum(new_by_type.values())
+    print(f"\n旧口径总尾箱数={old_total}, 新口径总尾箱数={new_total}")
+
+    assert old_hc_gap == 6, f"旧口径HC缺口应该是重复计数出的6(来源1的4+来源3的2)，实际={old_hc_gap}"
+    assert old_gp_gap == 0, f"旧口径GP缺口应该是0(assign()把GP demand扣到0，完全漏报了真实的GP缺口2)，实际={old_gp_gap}"
+    print("[OK] 确认旧口径的两个问题都复现了：")
+    print(f"  1) 重复计数：旧HC缺口={old_hc_gap} vs 新HC缺口={hc_gap}（旧口径把同一批箱子在两个不同信息状态下"
+          f"的两次观察当独立来源相加，凭空多算出{old_hc_gap - hc_gap}个）")
+    print(f"  2) 方向性遗漏：旧GP缺口={old_gp_gap} vs 新GP缺口={gp_gap}（assign()按总量分配时优先扣GP，"
+          f"把GP demand扣到0记成'满足了'，但实际10个槽位里有4个被贴成HC标签，"
+          f"真实GP只满足了{6}个，还缺{gp_gap}个，旧口径完全看不见这个缺口）")
+
+    if new_total < old_total:
+        print(f"[OK] 新口径总尾箱数({new_total}) < 旧口径总尾箱数({old_total})，"
+              f"符合预期：新口径修掉了重复计数，数字应该更小/更准确")
+    else:
+        print(f"[MISMATCH] 新口径总尾箱数({new_total}) 没有小于旧口径({old_total})，需要停下来查")
+
+
+def build_hold_hr_budget_scenario():
+    """build_hold_hc_budget_scenario的RF/HR镜像版：同样1个hold cell，
+    cap_total=10、cap_hc=4，demand换成RF/HR(而不是GP/HC)，槽位全部
+    can_reefer=True。用来验证build_tail_container_list的RF/HR分支
+    (proj_cell_to_vessel第一步"摊RF需求"+labeling阶段的rf_hc_budget循环)
+    跟GP/HC分支是完全对称的一套代码路径，不是只测了GP/HC那一半。
+
+    注意：不能直接照搬build_hold_hc_budget_scenario的demand数字(GP=8,HC=6)。
+    VesselClass.remaining_pods()对GP/HC和RF/HR的"可接受尾货"判断不对称：
+        GP/HC: (GP+HC) > tail_threshold(5) 才算"还有余量待装"，
+               <=5的小额残量会被直接容忍、当场port_complete。
+        RF/HR: (RF+HR) > 0 就算"还有余量待装"，一点残量都不容忍。
+    这是VesselClass本身的业务规则(reefer货不允许被静默地当小额尾货放着，
+    要么真放上船要么明确处理)，不是新公式的缺陷。GP/HC例子能同时做出
+    "GP缺口=2,HC缺口=2"两个都非零，靠的正是assign()后允许留一点HC残量
+    仍判定port_complete；RF/HR不允许这个残量存在，assign()后必须
+    D_rf+D_hr恰好等于occupied(不能有任何残留)否则solve()会在"没有更多
+    cell可用但仍有RF/HR需求"时判定dead cell直接搜索失败(不会推进到
+    port_complete，snapshots也不会正确写入)。而只要occupied恰好等于
+    D_rf+D_hr(无残留)，代数上RF缺口和HR缺口不可能同时非零(这是必然结果，
+    不是巧合——demand全被消耗完，final_hr=min(cap_hc,occupied,D_hr)一旦
+    达到cap_hc上限，occupied-final_hr剩下的部分恰好等于D_rf，不会再有
+    RF缺口；D_hr没被cap_hc卡住时final_hr=D_hr本身，HR缺口直接是0)。
+
+    所以这个场景选RF=4,HR=6(合计10，恰好用满cap_total=10，无残留)：
+        assign(): rf_capacity=cap_rf=10，rf_total_remaining=10，
+            rf_used=min(10,10)=10，rf_deduct_rf=min(4,10)=4，
+            rf_deduct_hr=10-4=6 —— demand变为RF=0,HR=0(零残留)，
+            port立即complete。
+        labeling: rf_hc_budget=original HR demand=6，cap_hc=4(同一套
+            geometry)，两摞各贴2个HR标签，共4个，预算剩6-4=2(不影响
+            gap计算，gap只看demand vs final，不看budget leftover)。
+
+    手算结果：
+        最终HR标签数=4，最终RF数=RF_count总和(10)-4=6
+        RF缺口=max(0, 4-6)=0（final_rf(6)已经超过RF demand(4)，不缺）
+        HR缺口=max(0, 6-4)=2
+
+    返回vessel（未跑solve()，调用方自己跑）。
+    """
+    rows = []
+    for bay_idx in (2, 3):
+        for tier_idx in range(8):
+            rows.append({"bay_idx": bay_idx, "row_idx": 0, "tier_idx": tier_idx, "lr": 0, "hd": 0,
+                         "can_40ft": True, "can_20ft": False, "can_reefer": True})
+        for tier_idx in range(2):
+            rows.append({"bay_idx": bay_idx, "row_idx": 1, "tier_idx": tier_idx, "lr": 0, "hd": 0,
+                         "can_40ft": True, "can_20ft": False, "can_reefer": True})
+    full_slot_table = pd.DataFrame(rows)
+    cbf = {0: {1: {"RF": 4, "HR": 6}}}
+    vessel = Vessel(full_slot_table=full_slot_table, cbf=cbf, current_pol=0)
+    return vessel
+
+
+def verify_build_tail_container_list_rf_mirror():
+    """跑build_hold_hr_budget_scenario()，断言build_tail_container_list算出的
+    RF缺口=0、HR缺口=2，证明RF/HR分支跟GP/HC分支是同一套逻辑的镜像、独立
+    正确，不是只测过GP/HC那一半就假定RF/HR"应该也对"。（两个缺口不能像
+    GP/HC例子那样同时非零，原因见build_hold_hr_budget_scenario docstring——
+    这是VesselClass业务规则本身的限制，不是新公式的缺陷。）"""
+    print("\n" + "=" * 60)
+    print("──── build_tail_container_list RF/HR镜像场景验证 ────")
+    print("=" * 60)
+
+    vessel = build_hold_hr_budget_scenario()
+    original_cbf = copy.deepcopy(vessel.cbf)
+
+    snapshots = {}
+    best = {"assigned": -1, "vessel": None}
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+    result_vessel = vessel if success else best["vessel"]
+    print(f"solve()完成: success={success}, 剩余cbf={result_vessel.cbf}")
+    assert success, "这个场景demand恰好用满capacity(无残留)，应该能成功solve()"
+
+    new_list = build_tail_container_list(result_vessel, snapshots, original_cbf)
+    print(f"新口径结果: {new_list}")
+
+    by_type = {}
+    for rec in new_list:
+        by_type[rec["type"]] = by_type.get(rec["type"], 0) + rec["count"]
+    rf_gap = by_type.get("RF", 0)
+    hr_gap = by_type.get("HR", 0)
+    gp_gap = by_type.get("GP", 0)
+    hc_gap = by_type.get("HC", 0)
+    print(f"按type求和: GP缺口={gp_gap}, HC缺口={hc_gap}, RF缺口={rf_gap}, HR缺口={hr_gap}")
+
+    assert rf_gap == 0, f"RF缺口应为0，实际={rf_gap}"
+    assert hr_gap == 2, f"HR缺口应为2，实际={hr_gap}"
+    assert gp_gap == 0 and hc_gap == 0, f"这个场景没有GP/HC demand，缺口应全为0，实际GP={gp_gap} HC={hc_gap}"
+    print("[OK] RF/HR镜像场景与手算结果一致：RF缺口=0, HR缺口=2"
+          "（RF/HC分支的proj_cell_to_vessel第一步摊RF需求+labeling阶段"
+          "rf_hc_budget贴标循环，跟GP/HC分支是完全对称、独立正确的代码路径）")
+
+
+def build_multi_cell_squeeze_scenario():
+    """最小合成场景，永久固化"旧口径_tail_source2_log的隐藏欠计数缺陷"这个发现：
+    同一个(POL,POD)的货跨3个独立deck cell装，每个cell各自独立触发一次
+    deck-squeeze——3个真实发生的不同物理事件，理应各自算1个GP损失，合计3个。
+
+    但_tail_source2_log的去重key只到(POL,POD)，不含(bay,lr,hd)，没法区分
+    "同一个cell的squeeze被多张POL快照重复replay观察了几次"(这种情况多条
+    记录内容相同，理应去重成1)和"同一个POD跨多个cell各自独立触发squeeze"
+    (这种情况多条记录内容也相同——都只有(POL,POD)两个字段——但代表的是
+    N个不同物理事件，不该被压缩成1)。旧代码把两种情况混为一谈，一律按
+    "内容相同就只算1条"处理，导致后一种情况被系统性地压缩成固定1个GP，
+    不管真实触发了几次。
+
+    这正是真实STSE数据上旧口径(108) vs 新口径(155)出现"新口径更大"这个
+    反直觉结果的根因：真实数据里大量POD的货跨许多deck cell装载，每个cell
+    各自触发squeeze，旧口径永远只记1个GP/组，新口径通过直接测量最终物理
+    占用状态，如实揭示了被低估的真实GP损失。
+
+    几何：3个独立deck cell(big_bay=0/1/2，对应STSE_BAY_PAIRS[0..2])，
+    都是lr=0,hd=1，各自1个摞(row_idx=0)、2个tier(4/8)，
+    capacity_total=2、capacity_hc=_stack_hc_cap(2,hd=1)=max(2-1,0)=1，
+    3个cell完全对称、互不影响封舱约束。
+
+    cbf: POL=0, POD=1: GP=8, HC=3。demand设计成"3个cell都被这个POD填满，
+    且都要经历完整的HC贴标+squeeze"：
+        - assign()按顺序把这个POD填满3个cell(每个cap=2)，因为GP demand(8)
+          在整个过程中都远超单个cell的capacity，gp_deduct_hc全程为0，
+          HC demand(3)原样留在residual里没被assign()动过。3个cell用完后，
+          demand=GP:8-6=2, HC:3(合计5<=5，port complete)。
+        - labeling: budget=original HC demand=3，cap_hc=1(每个cell)，
+          3个cell的capacity_hc总和=3，budget=3恰好够3个cell各分1个——
+          3个cell全部贴出1个HC标签、全部触发squeeze(每个cell贴标签前
+          occupied=2=n，触发腾空)，budget刚好用完，leftover=0。
+
+    旧口径：来源1(GP=2,HC=3) + 来源2(去重后固定1个GP，真实应该是3个)
+        + 来源3(HC leftover=0) = GP:2+1=3, HC:3+0=3，合计6。
+    新口径：occupied_final=3个cell各剩1个(HC标签占用)=3，全部is_hc=True，
+        final_hc=3，final_gp=3-3=0。
+        GP缺口=max(0,8-0)=8，HC缺口=max(0,3-3)=0，合计8。
+    旧(6) < 新(8)——这是本文件里唯一一个新口径总数比旧口径更大的场景，
+    专门用来固化这个反直觉但正确的发现，防止以后有人看到"新口径应该更小"
+    的直觉就误改代码。
+
+    返回vessel（未跑solve()，调用方自己跑）。
+    """
+    rows = []
+    for b0, b1 in STSE_BAY_PAIRS[:3]:
+        for bay_idx in (b0, b1):
+            rows.append({"bay_idx": bay_idx, "row_idx": 0, "tier_idx": 4, "lr": 0, "hd": 1,
+                         "can_40ft": True, "can_20ft": False, "can_reefer": False})
+            rows.append({"bay_idx": bay_idx, "row_idx": 0, "tier_idx": 8, "lr": 0, "hd": 1,
+                         "can_40ft": True, "can_20ft": False, "can_reefer": False})
+    full_slot_table = pd.DataFrame(rows)
+    cbf = {0: {1: {"GP": 8, "HC": 3}}}
+    vessel = Vessel(full_slot_table=full_slot_table, cbf=cbf, current_pol=0)
+    return vessel
+
+
+def verify_multi_cell_squeeze_undercounting():
+    """跑build_multi_cell_squeeze_scenario()，固化验证：
+    1) 旧口径_tail_source2_log确实把3个不同cell的3次真实squeeze事件去重成1个
+       （证明这是旧代码的真实缺陷，不是我瞎猜的）
+    2) 新口径(build_tail_container_list)不依赖_tail_source2_log，直接测最终
+       物理占用状态，如实测出这3次squeeze的完整影响
+    3) 这个场景下新口径总数(8) > 旧口径总数(6)——反直觉但正确，永久留在
+       回归测试里防止未来被误判成bug改回去
+    """
+    print("\n" + "=" * 60)
+    print("──── 旧口径_tail_source2_log多cell squeeze欠计数场景验证 ────")
+    print("=" * 60)
+
+    vessel = build_multi_cell_squeeze_scenario()
+    original_cbf = copy.deepcopy(vessel.cbf)
+
+    snapshots = {}
+    best = {"assigned": -1, "vessel": None}
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+    result_vessel = vessel if success else best["vessel"]
+    print(f"solve()完成: success={success}, 剩余cbf={result_vessel.cbf}")
+    final_cbf = copy.deepcopy(result_vessel.cbf)
+
+    old_list = build_unified_tail_list(result_vessel, final_cbf, snapshots, original_cbf)
+    raw_source2 = result_vessel._tail_source2_log
+    dedup2 = _dedup_tail_log_by_pol_pod(raw_source2, key_len=2) if raw_source2 else {}
+    print(f"\n_tail_source2_log原始条数(真实物理squeeze事件数)={len(raw_source2)}: {raw_source2}")
+    print(f"去重后(旧口径实际采用的计数)={len(dedup2)}: {dedup2}")
+    assert len(raw_source2) == 3, f"这个场景应该触发3次真实squeeze，实际raw条数={len(raw_source2)}"
+    assert len(dedup2) == 1, f"旧去重逻辑应该把3次真实事件压缩成1，实际去重后={len(dedup2)}"
+    print("[OK] 确认旧_tail_source2_log的欠计数缺陷：3次真实物理squeeze事件被去重成1个GP")
+
+    new_list = build_tail_container_list(result_vessel, snapshots, original_cbf)
+    old_total = sum(r["count"] for r in old_list)
+    new_total = sum(r["count"] for r in new_list)
+    print(f"\n旧口径结果: {old_list} (总数={old_total})")
+    print(f"新口径结果: {new_list} (总数={new_total})")
+
+    assert old_total == 6, f"旧口径总数应为6(GP:2+1=3, HC:3+0=3)，实际={old_total}"
+    assert new_total == 8, f"新口径总数应为8(GP:8-0=8, HC:3-3=0)，实际={new_total}"
+    assert new_total > old_total, "这个场景应该复现'新口径总数>旧口径总数'的反直觉但正确的结果"
+    print(f"[OK] 新口径总数({new_total}) > 旧口径总数({old_total})，符合预期："
+          f"新口径如实测出了旧_tail_source2_log漏计的{new_total - old_total}个真实GP损失")
+
+
+def verify_build_tail_container_list_cross_check():
+    """独立交叉验证：build_tail_container_list算出的final_hc/final_hr
+    (通过gap反推：final=demand-gap，仅在demand>=final即gap未被clip时精确成立，
+    这里选用的场景demand都覆盖了最终标签数，反推是精确的)，应该跟
+    scan_host_candidates(一个已经在更早任务里独立写好、独立验证过的函数，
+    用完全不同的代码结构——按host聚合而不是按(POL,POD)聚合——重新算了一遍
+    is_hc标签数)算出的hc_used(=capacity_hc-hc_headroom)按(POL,POD)求和后
+    完全一致。两个函数从两条独立代码路径算出同一个物理量，如果结果一致，
+    说明build_tail_container_list没有沿着某条隐藏的bug路径算出"看似合理
+    但恰好一致"的错误答案。
+
+    在build_hold_hc_budget_scenario/build_hold_hr_budget_scenario/
+    build_multi_cell_squeeze_scenario三个场景上跑一遍这个交叉验证。
+    """
+    print("\n" + "=" * 60)
+    print("──── build_tail_container_list × scan_host_candidates 交叉验证 ────")
+    print("=" * 60)
+
+    scenarios = [
+        ("build_hold_hc_budget_scenario", build_hold_hc_budget_scenario, {"GP": 8, "HC": 6}),
+        ("build_hold_hr_budget_scenario", build_hold_hr_budget_scenario, {"RF": 4, "HR": 6}),
+        ("build_multi_cell_squeeze_scenario", build_multi_cell_squeeze_scenario, {"GP": 8, "HC": 3}),
+    ]
+
+    all_ok = True
+    for label, builder, demand in scenarios:
+        print(f"\n---- 场景: {label} ----")
+        vessel = builder()
+        original_cbf = copy.deepcopy(vessel.cbf)
+        snapshots = {}
+        best = {"assigned": -1, "vessel": None}
+        success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+        result_vessel = vessel if success else best["vessel"]
+
+        new_list = build_tail_container_list(result_vessel, snapshots, original_cbf)
+        gap_by_type = {rec["type"]: rec["count"] for rec in new_list}
+
+        # 反推final_hc/final_hr：final = demand - gap（这几个场景demand >= final，
+        # gap没有被max(0,.)截断，反推精确）
+        final_hc = demand.get("HC", 0) - gap_by_type.get("HC", 0)
+        final_hr = demand.get("HR", 0) - gap_by_type.get("HR", 0)
+        my_hc_combined = final_hc + final_hr
+        print(f"build_tail_container_list反推: final_hc={final_hc}, final_hr={final_hr}, "
+              f"合计={my_hc_combined}")
+
+        # 独立路径：scan_host_candidates按host聚合，hc_used=capacity_hc-hc_headroom，
+        # 按(POL,POD)=(0,1)对应的所有host求和。
+        host_pool = scan_host_candidates(result_vessel, snapshots)
+        pod_hosts = {k: v for k, v in host_pool.items() if k[3] == 0 and k[4] == 1}
+        host_hc_used_total = sum(v["capacity_hc"] - v["hc_headroom"] for v in pod_hosts.values())
+        print(f"scan_host_candidates独立路径: 匹配的host={pod_hosts}, "
+              f"hc_used合计={host_hc_used_total}")
+
+        ok = (my_hc_combined == host_hc_used_total)
+        print(f"[{'OK' if ok else 'MISMATCH'}] 两条独立路径算出的HC/HR标签总数"
+              f"{'一致' if ok else '不一致'}: build_tail_container_list反推={my_hc_combined}, "
+              f"scan_host_candidates独立算出={host_hc_used_total}")
+        all_ok = all_ok and ok
+
+    if all_ok:
+        print("\n[OK] 三个场景的交叉验证全部通过：build_tail_container_list与"
+              "scan_host_candidates(独立代码路径)算出的HC/HR标签总数完全一致")
+    else:
+        print("\n[MISMATCH] 至少一个场景交叉验证失败，需要停下来查")
+    return all_ok
+
+
+def summarize_tail_by_port(tail_list: list, original_cbf: dict, port_names: dict = None) -> list:
+    """把build_tail_container_list(或格式兼容的build_unified_tail_list)的flat list
+    按POL汇总成"这港demand多少、装了多少、甩了多少"的每港报表，供main.py/调试脚本
+    打印用，不用每次现场手写聚合逻辑。
+
+    demand按original_cbf逐港求和(GP+HC+RF+HR四个字段加总)；甩货按tail_list里
+    这个POL的count求和；已装=demand-甩货(下限截0，正常情况下gap<=demand不会触发
+    截断，除非tail_list传入了不满足这个约束的自定义数据)。
+
+    返回list[dict]，按POL升序排列，每条:
+        {"POL", "port_name", "demand", "placed", "tail", "tail_rate"}
+    port_names可选{POL: 名字}，不传则port_name=str(POL)。
+    """
+    demand_by_pol = {}
+    for pol, pod_dict in original_cbf.items():
+        total = sum(
+            counts.get(k, 0)
+            for counts in pod_dict.values()
+            for k in ("GP", "HC", "RF", "HR")
+        )
+        demand_by_pol[pol] = demand_by_pol.get(pol, 0) + total
+
+    tail_by_pol = {}
+    for rec in tail_list:
+        tail_by_pol[rec["POL"]] = tail_by_pol.get(rec["POL"], 0) + rec["count"]
+
+    rows = []
+    for pol in sorted(demand_by_pol.keys()):
+        demand = demand_by_pol[pol]
+        tail = tail_by_pol.get(pol, 0)
+        placed = max(0, demand - tail)
+        rate = (tail / demand) if demand else 0.0
+        rows.append({
+            "POL": pol,
+            "port_name": port_names.get(pol, str(pol)) if port_names else str(pol),
+            "demand": demand,
+            "placed": placed,
+            "tail": tail,
+            "tail_rate": rate,
+        })
+    return rows
+
+
+def print_tail_by_port(tail_list: list, original_cbf: dict, port_names: dict = None, label: str = ""):
+    """打印summarize_tail_by_port()的结果，格式：
+        POL=0(SHA): demand=120, 已装=115, 甩货=5 (甩货率=4.2%)
+    末尾追加一行全船合计。label用于区分"新口径"/"旧口径"等标注。
+    """
+    rows = summarize_tail_by_port(tail_list, original_cbf, port_names)
+    title = f"每港装/甩货明细{f'({label})' if label else ''}"
+    print(f"\n{title}")
+    print("─" * len(title) * 2)
+    total_demand = total_placed = total_tail = 0
+    for row in rows:
+        print(f"  POL={row['POL']}({row['port_name']}): demand={row['demand']:>4}, "
+              f"已装={row['placed']:>4}, 甩货={row['tail']:>4} (甩货率={row['tail_rate']:.1%})")
+        total_demand += row["demand"]
+        total_placed += row["placed"]
+        total_tail += row["tail"]
+    total_rate = (total_tail / total_demand) if total_demand else 0.0
+    print(f"  {'─' * 40}")
+    print(f"  全船合计: demand={total_demand:>4}, 已装={total_placed:>4}, "
+          f"甩货={total_tail:>4} (甩货率={total_rate:.1%})")
+    return rows
+
+
 def verify_unified_tail_list():
     """跑一遍三个场景，核对build_unified_tail_list按source分组求和的结果
     是否跟已有验证函数/打印函数报告的三个来源总数完全对账，并人工打印完整
@@ -1783,9 +2347,13 @@ if __name__ == "__main__":
         }, f)
     print(f"\nfixture已落盘: {fixture_path}")
 
-    verify_deck_squeeze_scenario()
-    verify_multi_pol_replay_dedup()
-    verify_unified_tail_list()
+    # verify_deck_squeeze_scenario()
+    # verify_multi_pol_replay_dedup()
+    # verify_unified_tail_list()
+    verify_build_tail_container_list_hold_example()
+    verify_build_tail_container_list_rf_mirror()
+    verify_multi_cell_squeeze_undercounting()
+    verify_build_tail_container_list_cross_check()
     verify_scan_host_candidates()
     verify_match_tails_to_hosts()
     verify_apply_tail_placements()

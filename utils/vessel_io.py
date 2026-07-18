@@ -203,6 +203,54 @@ def cbf_df_to_dict(df: pd.DataFrame) -> dict:
         result[int(pod)] = totals
     return result
 
+def cbf_df_to_dict_with_20(df: pd.DataFrame) -> dict:
+    """(POD,length,type,count) -> {POD: {"GP":n,"HC":n,"RF":n,"HR":n,"20GP":n,"20HC":n,"20RF":n,"20HR":n}}。
+    GP/HC/RF/HR字段只统计真正的40ft箱数，不做cbf_df_to_dict里的20ft//2折算；
+    20ft箱的原始箱数（不做//2折算）单独记到20GP/20HC/20RF/20HR字段，不并入40ft计数。
+    length='UNKNOWN'的行跳过并警告。"""
+    result = {}
+    for pod, group in df.groupby("POD"):
+        totals = {"GP": 0, "HC": 0, "RF": 0, "HR": 0, "20GP": 0, "20HC": 0, "20RF": 0, "20HR": 0}
+        for _, row in group.iterrows():
+            if row.length == "UNKNOWN":
+                print(f"警告: POD={pod} type={row.type} length无法识别，count={row['count']}已跳过")
+                continue
+            box_type = row.type if row.type in ("GP", "HC", "RF", "HR") else "GP"
+            if row.length == 20:
+                totals[f"20{box_type}"] += int(row["count"])
+                continue
+            totals[box_type] += int(row["count"])
+        result[int(pod)] = totals
+    return result
+
+def batch_parse_cbf_with_20(raw_dir, cbf_dir):
+    """cbf_df_to_dict_with_20的批量落盘姊妹函数，遍历raw_dir下所有.cbf文件，
+    汇总成{POL:{POD:{"GP":n,"RF":n,...,"20GP":n,...}}}，存一份cbf_with_20.json。
+    不接入求解器或其他调用点。"""
+    os.makedirs(cbf_dir, exist_ok=True)
+    cbf = {}
+    written = {}
+    for fname in os.listdir(raw_dir):
+        if not fname.upper().endswith(".CBF"):
+            continue
+        pol_code = re.split(r"[ _]+", os.path.splitext(fname)[0])[-1].upper()
+        if pol_code not in STSE_PORT_MAP:
+            print(f"警告: {fname} 文件名末段POL='{pol_code}' 不在STSE_PORT_MAP里，跳过")
+            continue
+
+        df = parse_cbf_file(os.path.join(raw_dir, fname))
+        pol_num = STSE_PORT_MAP[pol_code]
+        if pol_num in written:
+            print(f"警告: POL={pol_num}({pol_code}) 被 {fname} 覆盖（之前来自 {written[pol_num]}）")
+        written[pol_num] = fname
+        cbf[pol_num] = cbf_df_to_dict_with_20(df)
+
+    cbf = dict(sorted(cbf.items()))
+    out_path = os.path.join(cbf_dir, "cbf_with_20.json")
+    with open(out_path, "w") as f:
+        json.dump(cbf, f, indent=2)
+    return cbf
+
 def batch_parse_cbf(raw_dir, cbf_dir):
     """遍历raw_dir下所有.cbf文件，从文件名取最后一段(空格/下划线分隔)作为POL三字码，
     查STSE_PORT_MAP编号，汇总成{POL:{POD:{"GP":n,"RF":n}}}，存一份cbf.json。"""
