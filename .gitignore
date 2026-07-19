@@ -58,6 +58,7 @@ logs/
 
 # Data
 data/
+storage/
 
 # Arxiv
 arxiv/
