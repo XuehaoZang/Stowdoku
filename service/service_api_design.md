@@ -1,6 +1,6 @@
 # 集装箱船舶配载系统 —— 后端服务化 & 输出接口设计
 
-> v3.0，供 Claude Code 开发参考
+> v4.1，供 Claude Code 开发参考
 
 ## 0. 总原则
 
@@ -20,7 +20,11 @@
 // ============================================================
 interface BayPlanResult {
   planId: string;
+  /** 所属一次求解(Run)，同一个 runId 下有多个 planId 并列（每港一个），互为兄弟 */
+  runId: string;
   voyageId: string;
+  /** 本快照对应哪个港口的departure时刻，取值来自 voyageLegs 中的 portCode */
+  portCode: string;
   generatedAt: string;
 
   vessel: VesselInfo;
@@ -59,6 +63,10 @@ interface LegendEntry {
 
 // ============================================================
 // Bay
+// 分组口径：按物理 bay_idx（与 full_slot_table.csv / proj_cell_to_vessel 输出粒度一致，
+// 即前端要照着画的物理网格），不是评估函数用的 big_bay(7个)。
+// metrics.byBay 的 key 只覆盖每对 STSE_BAY_PAIRS 里 b0 那一侧的 bayId（评估口径本就以b0为代表），
+// bay_idx=0（纯20ft、不参与配对）和每对里的 b1 侧不会出现在 metrics.byBay 里。
 // ============================================================
 interface Bay {
   bayId: string;
@@ -86,6 +94,15 @@ interface Slot {
   /** 数据源：full_slot_table.csv。can_20ft/can_40ft 均为 false 的槽位记为 STRUCTURAL 不可用 */
   unavailableReason?: "STRUCTURAL" | "USER_CONSTRAINT" | "OTHER"; // USER_CONSTRAINT 为未来预留，本版不产出
 
+  /** 数据一致性信号，不影响 status 判定优先级（STRUCTURAL 判定依旧优先）。
+   *  当某slot的can_20ft/can_40ft均为false（即status=UNAVAILABLE/STRUCTURAL），
+   *  但proj_cell_to_vessel投影结果里该slot的POD/POL≠-1（算法认为此处有货）时，
+   *  打上 "STRUCTURAL_OCCUPIED_CONFLICT"——这是上游HC/HR二次分配启发式与
+   *  full_slot_table物理能力表之间的既有不一致（详见 service/tests/test_translator.py
+   *  里 hc_on_structural 的记录），translator 不做修复也不静默丢弃，只透传信号。
+   *  本版只定义这一个取值，无冲突时不产出该字段。*/
+  dataIntegrityFlag?: "STRUCTURAL_OCCUPIED_CONFLICT" | string;
+
   /** 槽位物理承载能力，来自 full_slot_table.csv 的 can_20ft/can_40ft，与 status 独立 */
   capability?: { can20ft: boolean; can40ft: boolean };
 
@@ -99,6 +116,11 @@ interface Slot {
 interface ContainerPlacement {
   pod: string; // 对应 legend.groupKey
   pol: string;
+  /** 直接读 slot 行的 is_20ft 字段判定：True→20ft，False→40ft；
+   *  再结合 is_hc 判定 GP/HC。is_20ft 由上游一个独立标注流程写入同一份CSV，
+   *  不是从 can_40ft/can_20ft/is_hc 组合推导，translator 不需要自己做这层推理。
+   *  当前测试数据 is_20ft 恒为False（占位），schema 已经能承载真实小箱颗粒度，
+   *  上游标注流程就绪后无需改动 schema。 */
   sizeType: "20GP" | "40GP" | "40HC" | "45HC" | string;
   attributeFlags: AttributeFlag[]; // H / 危险品 / 冷藏 / 超重 / 超限 等
   weightKg?: number;
@@ -143,8 +165,10 @@ interface MetricEntry {
 ### 资源模型
 ```
 Voyage —— 航次（POL/POD序列 + 各港CBF）
-  └─ Plan —— 一次配载方案结果（BayPlanResult），落盘后不可变
+  └─ Run —— 一次 solve() 求解
+       └─ Plan（×7，每港一个）—— 单港departure快照（BayPlanResult），落盘后不可变
 ```
+一次求解产出7个并列的 Plan，彼此不是父子关系，是"同一个 runId 下的兄弟"。
 
 ### 端点
 
@@ -163,16 +187,24 @@ POST /api/v1/voyages/{voyageId}/cbf   (multipart/form-data: 多个 .cbf 文件)
 > `warnings` 来自 `parse_cbf_file`/`batch_parse_cbf` 新增的可选 `warnings: list` 收集参数（TODO，现有 print 逻辑不变，只是多开一个输出通道）。service 层拿到 warnings 后自行判断：有 warnings 但结果非空 → 200/202 + 透传 warnings；结果为空或关键字段缺失 → `CBF_FORMAT_INVALID`。
 
 ```
-POST /api/v1/voyages/{voyageId}/plans
-→ 202 { "planId": "PLAN-0001", "status": "QUEUED" }
+POST /api/v1/voyages/{voyageId}/runs
+→ 202 { "runId": "RUN-0001", "status": "QUEUED" }
 ```
+> 触发一次 `solve()`，完成后原地生成7个 Plan（每港一个），不需要客户端逐港单独触发。
+
+```
+GET /api/v1/voyages/{voyageId}/runs/{runId}
+→ 200 { "status": "COMPLETED", "plans": [ { "portCode": "CNSHA", "planId": "PLAN-0001-CNSHA" }, ... ] }
+→ 200 { "status": "PROCESSING" }
+→ 200 { "status": "FAILED", "errorCode": "PLAN_INFEASIBLE" }
+```
+> 列出该次求解产出的全部Plan索引，不含完整 BayPlanResult 内容，仅供前端做港口切换的目录。
 
 ```
 GET /api/v1/voyages/{voyageId}/plans/{planId}
 → 200 { "status": "COMPLETED", "result": <BayPlanResult> }
-→ 200 { "status": "PROCESSING" }
-→ 200 { "status": "FAILED", "errorCode": "PLAN_INFEASIBLE" }
 ```
+> 拿单个港口快照的完整结果。`planId` 建议取 `{runId}-{portCode}` 形式，天然唯一且可读。
 
 > 本版不建 Constraint 端点、不建 diff 端点。
 
@@ -195,11 +227,12 @@ API 网关层
   - 鉴权、限流、请求校验、统一错误格式化
         │ 内部调用（不对公网暴露）
 业务服务层
-  - Voyage/Plan 生命周期管理
+  - Voyage/Run/Plan 生命周期管理（一次Run产出7个Plan）
   - CBF 解析校验（复用现有 parse_cbf_file/batch_parse_cbf，接 warnings）
-  - 【反腐层 translator.py】：snapshot + eval_results + Vessel静态几何 -> BayPlanResult
+  - 【反腐层 translator.py】：单港snapshot + eval_results + Vessel静态几何 -> 单个BayPlanResult
+    （对7港循环调用7次，产出7个Plan，翻译层本身仍是单港粒度的纯函数）
   - CSV/PNG 内部存档（不对外暴露）
-  - Plan 结果落盘（storage/plans/{planId}/result.json），生成后不可变
+  - Plan 结果落盘（storage/runs/{runId}/plans/{portCode}/result.json），生成后不可变
         │ 进程内调用 / 任务队列
 算法核心层（黑箱，不改动返回值签名）
   - Vessel.proj_cell_to_vessel() / evaluate_xxx：结构化只读输出，直接作为 translator 输入
@@ -223,8 +256,9 @@ service/
 ## 4. 存储设计
 
 - 文件存储，不接数据库。
-- `storage/plans/{planId}/result.json`：对外 JSON，计算完成时生成一次，**之后不可变**（即使 translator 逻辑后续更新，历史 plan 的 JSON 不回溯变化）。
-- `storage/plans/{planId}/archive/`：CSV/PNG，内部审计用，不挂对外路由，前端可通过下载弹窗获取。
+- `storage/runs/{runId}/plans/{portCode}/result.json`：对外 JSON，计算完成时逐港生成，**之后不可变**（即使 translator 逻辑后续更新，历史 plan 的 JSON 不回溯变化）。`planId = {runId}-{portCode}`。
+- `storage/runs/{runId}/plans/{portCode}/archive/`：CSV/PNG，内部审计用，不挂对外路由，前端可通过下载弹窗获取。
+- `storage/runs/{runId}/index.json`：该次求解7个港口的目录（portCode→planId→status），供 `GET /runs/{runId}` 直接读取。
 - `GET /plans/{planId}` 直接读已落盘的 `result.json`，不重复调用 translator。
 
 ---
@@ -234,3 +268,4 @@ service/
 1. 20ft 箱逻辑：solver 当前不支持小箱决策，待 solver 补齐后再评估是否需要在 schema 中体现相关状态。
 2. CBF 解析容错：`warnings` 收集参数为 TODO，需在 `parse_cbf_file`/`batch_parse_cbf` 中新增，不改变现有 print 行为。
 3. STSE_PORT_MAP 硬编码：当前继续复用；未来支持任意航线时，评估是否由前端在 `POST /voyages` 时传入完整港口定义动态生成。
+4. `is_20ft` 标注流程的就绪时间：当前测试数据该字段恒为False，translator 开发时先按"全40ft"场景验证，标注流程接入后按同一套字段读取逻辑自动生效，无需额外适配。

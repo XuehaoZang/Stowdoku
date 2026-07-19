@@ -19,6 +19,14 @@ B. 总量守恒（按(POL,POD)分组）：
    self.cbf里该(POL,POD)剩余的(GP+HC+RF+HR) == original_cbf[POL][POD]的
    GP+HC+RF+HR原始总量。
 
+C. 摞内occupied tier连续性（按(bay_idx, row_idx, hd)分组，即"摞"，
+   (bay_idx, row_idx, hd)已验证在can_40ft槽位里能唯一确定lr）：
+   实际占用(GP_count>0或RF_count>0)的tier_idx集合，必须是该摞全部
+   can_40ft tier_idx(按tier_idx升序排序)的一个前缀——即从该摞最低tier
+   开始连续占用，不能有空洞(例如低tier空、高tier反而占用)。这是
+   _settle_leftover_gp/_settle_leftover_rf释放顺序(必须按tier_idx降序
+   释放，先释放当前occupied里tier最高的)要保证的不变量。
+
 同一个(POL,POD)分组会在它被discharge之前，原样出现在多张连续POL快照里
 (proj_cell_to_vessel对同一分组的投影结果是幂等的，见其docstring)，B部分
 只取每个分组第一次出现的那次投影结果计数，避免跨快照重复计入。
@@ -64,6 +72,10 @@ def main():
     a_hold_fail_msgs = []
     a_deck_fail_msgs = []
 
+    c_checked = 0
+    c_failed = 0
+    c_fail_msgs = []
+
     # B部分：每个(POL,POD)分组只取第一次出现的投影结果计数
     b_seen = {}  # (pol, pod) -> {"real_gp":n, "real_rf":n, "hc":n}
     stacks_checked_keys = set()  # (pol_snapshot, bay_idx, row_idx, hd) 去重计数用
@@ -87,6 +99,22 @@ def main():
                 continue
             stacks_checked_keys.add(stack_key)
             a_checked += 1
+
+            # ── C: 摞内occupied tier必须从最低tier开始连续、无空洞 ──
+            occupied_sub = sub[(sub["GP_count"] > 0) | (sub["RF_count"] > 0)]
+            if not occupied_sub.empty:
+                c_checked += 1
+                full_tiers = sorted(sub["tier_idx"].tolist())
+                occupied_tiers = sorted(occupied_sub["tier_idx"].tolist())
+                expected_prefix = full_tiers[:len(occupied_tiers)]
+                if occupied_tiers != expected_prefix:
+                    c_failed += 1
+                    lr = int(sub["lr"].iloc[0])
+                    c_fail_msgs.append(
+                        f"POL={pol}, bay_idx={bay_idx}, lr={lr}, hd={hd}, row_idx={row_idx}: "
+                        f"占用tier集合={occupied_tiers}, 该摞全部tier(升序)={full_tiers}, "
+                        f"应从最低tier连续占用(期望前缀={expected_prefix})"
+                    )
 
             if hd == 0:
                 # A.1 hold摞：is_hc标签数 <= quota(n)
@@ -194,17 +222,28 @@ def main():
         print("  (无)")
 
     print("\n" + "=" * 70)
+    print("C. 摞内occupied tier连续性 - 违规明细")
+    print("=" * 70)
+    if c_fail_msgs:
+        for m in c_fail_msgs:
+            print("  " + m)
+    else:
+        print("  (无)")
+
+    print("\n" + "=" * 70)
     print("汇总")
     print("=" * 70)
     print(f"(POL,POD)分组数 = {len(b_seen)}")
     print(f"A部分检查的摞数 = {a_checked}, 通过 = {a_checked - a_failed}, 失败 = {a_failed}")
     print(f"B部分检查的分组数 = {b_checked}, 通过 = {b_checked - b_failed}, 失败 = {b_failed}")
+    print(f"C部分检查的摞数(有占用的) = {c_checked}, 通过 = {c_checked - c_failed}, 失败 = {c_failed}")
 
-    all_ok = (a_failed == 0) and (b_failed == 0)
+    all_ok = (a_failed == 0) and (b_failed == 0) and (c_failed == 0)
     print(f"\n最终结论: {'[OK] 全部通过' if all_ok else '[FAIL] 存在违规，见上方明细'}")
 
     assert a_failed == 0, f"A部分存在{a_failed}处摞级quota违规，见上方打印"
     assert b_failed == 0, f"B部分存在{b_failed}处总量守恒违规，见上方打印"
+    assert c_failed == 0, f"C部分存在{c_failed}处摞内tier连续性违规，见上方打印"
 
 
 if __name__ == "__main__":

@@ -141,7 +141,8 @@ def _render_bayplan(slots, title, filename, save_dir, port_colors, port_names=No
             else:
                 color = port_colors.get(slot.POD, "#3498db")
 
-            rect = patches.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor=color, edgecolor="black", linewidth=0.5)
+            rect = patches.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor=color, edgecolor="black",
+                                      linewidth=0.5, zorder=1)
             ax.add_patch(rect)
 
             is_hc = bool(slot.is_hc)
@@ -154,8 +155,23 @@ def _render_bayplan(slots, title, filename, save_dir, port_colors, port_names=No
                 label = "R"
             else:
                 label = None
+
+            if bool(slot.is_20ft):
+                # is_20ft=True：叠加一条右上-左下斜线，代表这个40ft格子实际是2个20ft箱。
+                # zorder=2，压在底色格子(zorder=1)之上、文字(zorder=3)之下。
+                # 格子里有文字标签(H/HR/R)时中间留空隙避免盖住文字；没有标签时画一条完整斜线。
+                if label:
+                    gap = 0.18
+                    ax.plot([x - 0.5, x - gap], [y - 0.5, y - gap],
+                            color="#333333", linewidth=0.6, zorder=2, solid_capstyle="butt")
+                    ax.plot([x + gap, x + 0.5], [y + gap, y + 0.5],
+                            color="#333333", linewidth=0.6, zorder=2, solid_capstyle="butt")
+                else:
+                    ax.plot([x - 0.5, x + 0.5], [y - 0.5, y + 0.5],
+                            color="#333333", linewidth=0.6, zorder=2, solid_capstyle="butt")
+
             if label:
-                ax.text(x, y, label, ha="center", va="center", fontsize=6, color="black")
+                ax.text(x, y, label, ha="center", va="center", fontsize=5, color="black", zorder=3)
 
         ax.set_xlim(-0.6, n_rows_global - 0.4)
         ax.set_ylim(-0.6, n_tiers_global - 0.4)
@@ -185,7 +201,9 @@ def _render_bayplan(slots, title, filename, save_dir, port_colors, port_names=No
         )
         for pod, color in port_colors.items()
     ]
-    legend_handles.append(patches.Patch(color="#D9D9D9", label="20ft", ec="black", lw=0.5))
+    # "20ft"图例swatch改成代表is_20ft的斜线标记（白底+斜线），不再是can_20ft槽位的灰色底色。
+    legend_handles.append(patches.Patch(facecolor="white", edgecolor="black", hatch="/",
+                                         label="20ft", lw=0.5))
     # legend_handles.append(patches.Patch(facecolor="white", edgecolor="black", label="Reefer"))
     fig.legend(
         handles=legend_handles, loc="center left", bbox_to_anchor=(0.92, 0.5),
@@ -208,7 +226,7 @@ def plot_bayplan(slots, title="bayplan", filename="bayplan.png", save_dir=".",
     slots: Vessel.proj_cell_to_vessel()的输出，含
            bay_idx, row_idx, tier_idx, lr, hd, POL, POD, GP_count, RF_count 列，
            以及can_40ft/can_20ft/can_reefer列（沿用full_slot_table自带的这几列，
-           proj_cell_to_vessel透传保留）。
+           proj_cell_to_vessel透传保留），以及is_20ft列（post-solve relabel标记）。
     port_colors: 可选{POD: color}，不传则按出现的POD值自动生成。
     if_plot_phy: False(默认)只输出idx版本(文件名不变)；
                  True则额外多输出一份物理坐标版本，文件名在原名基础上加"_phy"后缀
@@ -221,6 +239,8 @@ def plot_bayplan(slots, title="bayplan", filename="bayplan.png", save_dir=".",
         can_reefer=True 且 该cell的RF_count>0               -> 叠加"R"标记
         is_hc=True                                          -> 叠加"H"标记
         （同时满足以上两条 -> 叠加"HR"标记）
+        is_20ft=True                                        -> 叠加一条右上到左下的细斜线
+            （不改变底色，只是叠加标记；is_20ft=False的格子不受影响）
 
     bay子图按_bay_grid_positions()算出的版面位置排布，对应真实配载图惯例
     （同一对pair的b0在上、b1在下，整体块顺序倒转，块内降序，Bay01排在末尾）。

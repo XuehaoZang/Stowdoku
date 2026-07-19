@@ -33,6 +33,7 @@ from CSP_solver import solve
 from utils.tail import (
     build_unified_tail_list, build_tail_container_list,
     scan_host_candidates, match_tails_to_hosts, apply_tail_placements,
+    _physical_occupied_total,
 )
 
 
@@ -94,11 +95,46 @@ def main():
     for t in ("GP", "HC", "RF", "HR"):
         print(f"  {t}: {old_by_type.get(t, 0)} -> {new_by_type.get(t, 0)}")
 
-    if new_total < old_total:
-        print(f"[OK] 新口径总数({new_total}) < 旧口径总数({old_total})，"
-              f"符合预期：新口径消除了来源1/来源3对同一批箱子的重复计数")
+    # P0阶段已证伪"新口径总数<=旧口径总数"这个假设（见utils/tail.py
+    # verify_multi_cell_squeeze_undercounting）：旧口径除了来源1/来源3的重复
+    # 计数（会让旧口径偏大），来源2还有一种独立的去重导致的漏计缺陷（会让旧
+    # 口径偏小），新旧口径大小关系不是单调的，不能拿来当校验标准。改用守恒
+    # 不变量逐(POL,POD)校验：该(POL,POD)四类缺口之和 == max(0, 总demand -
+    # 实际占用物理槽位数)。
+    print("\n" + "=" * 60)
+    print("──── 新口径守恒不变量逐(POL,POD)校验 ────")
+    print("=" * 60)
+    pol_pod_pairs = sorted(
+        (pol, pod)
+        for pol, pod_dict in original_cbf.items()
+        for pod in pod_dict.keys()
+    )
+    conservation_ok = 0
+    conservation_fail = []
+    for pol, pod in pol_pod_pairs:
+        demand = original_cbf.get(pol, {}).get(pod, {})
+        demand_total = sum(demand.get(k, 0) for k in ("GP", "HC", "RF", "HR"))
+        actual_total_gap = sum(rec["count"] for rec in new_list if rec["POL"] == pol and rec["POD"] == pod)
+        physical_occupied = _physical_occupied_total(result_vessel, snapshots, original_cbf, pol, pod)
+        expected_total_gap = max(0, demand_total - physical_occupied)
+        ok = (actual_total_gap == expected_total_gap)
+        status = "OK" if ok else "MISMATCH"
+        print(f"[{status}] POL={pol} POD={pod}: demand_total={demand_total}, "
+              f"physical_occupied={physical_occupied}, expected_total_gap={expected_total_gap}, "
+              f"actual_total_gap={actual_total_gap}")
+        if ok:
+            conservation_ok += 1
+        else:
+            conservation_fail.append((pol, pod, demand_total, physical_occupied, expected_total_gap, actual_total_gap))
+
+    print(f"\n守恒不变量校验：通过 {conservation_ok}/{len(pol_pod_pairs)}, 失败 {len(conservation_fail)}")
+    if conservation_fail:
+        print("[MISMATCH] 失败明细：")
+        for pol, pod, demand_total, physical_occupied, expected_total_gap, actual_total_gap in conservation_fail:
+            print(f"  POL={pol} POD={pod}: demand_total={demand_total}, physical_occupied={physical_occupied}, "
+                  f"expected_total_gap={expected_total_gap}, actual_total_gap={actual_total_gap}")
     else:
-        print(f"[MISMATCH] 新口径总数({new_total}) 没有小于旧口径({old_total})，需要停下来查")
+        print("[OK] 所有(POL,POD)守恒不变量全部成立")
 
     # 用新口径的列表跑一遍完整下游管线，证明格式即插即用，不用改
     # scan_host_candidates/match_tails_to_hosts/apply_tail_placements的实现。

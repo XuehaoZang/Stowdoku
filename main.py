@@ -15,6 +15,7 @@ main.py - 编排入口，负责数据准备 + 求解 + 导出的完整流水线
 """
 
 import os
+import json
 import random
 import copy
 import time
@@ -31,7 +32,7 @@ from CSP_solver import solve, reset_small_pod_ci_stats, _small_pod_ci_stats
 from utils.evaluate import evaluate_crane_time, evaluate_pod_discharge_spread
 from utils.tail import (
     build_unified_tail_list, scan_host_candidates, match_tails_to_hosts,
-    build_tail_container_list, print_tail_by_port,
+    build_tail_container_list, print_tail_by_port, apply_tail_placements,
 )
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
@@ -76,9 +77,57 @@ def ensure_cbf() -> str:
 
     return CBF_JSON
 
+def plot_tail_before_after(vessel, snapshots, original_cbf, placements, out_dir, port_names=None):
+    """在尾箱真正填充进host槽位之前/之后，各落盘一版bayplan png，供人工对比
+    尾箱安置前后的差异。
+
+    version1(填充前)/version2(叠加尾箱后)都来自apply_tail_placements的两次
+    独立投影（见其docstring），不修改传入的vessel/snapshots本身。文件名分别
+    加_pre_tail/_post_tail后缀，跟export_bayplan落盘的常规bayplan png区分开。
+    """
+    from utils.viz import plot_bayplan, _default_port_colors
+    from utils.vessel_io import STSE_PORT_COLORS
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    version1_dict, version2_dict = apply_tail_placements(vessel, snapshots, original_cbf, placements)
+
+    all_pods = set()
+    for df in version2_dict.values():
+        all_pods.update(df.loc[df["POD"] != -1, "POD"].unique().tolist())
+    fallback_colors = _default_port_colors(all_pods)
+    port_colors = {}
+    for pod in all_pods:
+        code = port_names.get(pod) if port_names else None
+        port_colors[pod] = STSE_PORT_COLORS.get(code, fallback_colors[pod])
+
+    paths = []
+    for pol in sorted(version1_dict.keys()):
+        code = port_names.get(pol, str(pol)) if port_names else str(pol)
+        paths += plot_bayplan(
+            version1_dict[pol], title=f"POL={pol} ({code}) departure - 尾箱填充前",
+            filename=f"{pol}_{code}_DEP_bayplan_pre_tail.png",
+            save_dir=out_dir, port_colors=port_colors, port_names=port_names,
+        )
+        paths += plot_bayplan(
+            version2_dict[pol], title=f"POL={pol} ({code}) departure - 尾箱填充后",
+            filename=f"{pol}_{code}_DEP_bayplan_post_tail.png",
+            save_dir=out_dir, port_colors=port_colors, port_names=port_names,
+        )
+
+    print(f"  🖼  尾箱填充前/后bayplan已落盘: {out_dir}（{len(paths)}张）")
+    return paths
+
+
 def main():
     geometry_dir = ensure_geometry()
     cbf_json_path = ensure_cbf()
+    with open(CBF_WITH_20_JSON) as f:
+        raw_cbf_with_20 = json.load(f)
+    cbf_with_20 = {
+        int(pol): {int(pod): counts for pod, counts in pod_counts.items()}
+        for pol, pod_counts in raw_cbf_with_20.items()
+    }
 
     # 初始化母本 Vessel
     base_vessel = Vessel.load_vessel(geometry_dir, cbf_json_path)
@@ -140,19 +189,15 @@ def main():
                 print(f"  [Seed {seed:>4}] 失败: 连一个箱子都没能装上")
                 continue
 
-            tail_boxes = sum(
-                counts.get("GP", 0) + counts.get("RF", 0) + counts.get("HC", 0) + counts.get("HR", 0)
-                for pod_dict in result_vessel.cbf.values()
-                for counts in pod_dict.values()
-            )
-            # 注意：这只是vessel.cbf的原始残量(旧口径的"来源1")，不含deck-squeeze
-            # 或HC/RF预算池分不完的部分，比真实尾箱数偏小很多；这里只是每个种子
-            # 都要跑一遍的快速信号(用来在打印/mean-var统计里粗略比较不同种子)，
-            # 不追求精确，也不参与best_record_for_group的选优标准(选优用的是
-            # total_voyage_time)。真正准确、跟build_tail_container_list("最终结果
-            # vs 原始demand"一次性比较，见utils/tail.py)对得上的尾箱数字，
-            # 只在下面"组最优"那一段对best_vessel_for_group单独跑一次
-            # (跑一次全船proj_cell_to_vessel的成本，不值得在每个种子上都付一遍)。
+            # tail_boxes是每个种子都要跑一遍的快速信号，用于打印/mean-var统计里
+            # 粗略比较不同种子，不追求精确，也不参与best_record_for_group的选优
+            # 标准(选优用的是total_voyage_time)。跑一次全船proj_cell_to_vessel
+            # (build_tail_container_list的成本)对seeds循环规模(数十个种子)来说
+            # 不算贵，直接用新口径算，比旧口径的"vessel.cbf残量"更准，也不用再
+            # 维护两套统计口径。真正的精确值（跟组最优单独选出的best_vessel一致）
+            # 已经在下面"组最优"那一段对best_vessel_for_group重新算过一次。
+            seed_tail_list = build_tail_container_list(result_vessel, snapshots, original_cbf)
+            tail_boxes = sum(rec["count"] for rec in seed_tail_list)
 
             total_voyage_time = 0.0
             total_wait_time = 0.0
@@ -215,43 +260,54 @@ def main():
                 f"全程耗时={b['total_voyage_time']:.1f}, "
                 f"利用率={b['voyage_utilization']:.3f}" if b['voyage_utilization'] is not None else "N/A")
 
-            # 尾箱后处理：对组最优解跑一遍完整链路 build_unified_tail_list ->
+            # 尾箱后处理：对组最优解跑build_tail_container_list(新口径) ->
             # scan_host_candidates -> match_tails_to_hosts，产出尾箱安置台账。
-            # final_cbf必须在build_unified_tail_list(内部会调用proj_cell_to_vessel
-            # 写回best_vessel_for_group.cbf)之前深拷贝，理由同utils/tail.py里的
-            # 同款注释：来源1读的是proj_cell_to_vessel执行前的cbf切面。
+            # 这是P2转正后的主口径；旧口径(build_unified_tail_list来源1+2+3)
+            # 仍然可调用，但默认不在标准输出里打印完整台账，只留一行提示，
+            # 避免每次跑批测试都刷一遍旧口径明细。把下面PRINT_LEGACY_TAIL_DETAIL
+            # 改成True即可恢复旧口径的完整输出，供需要回归对比时使用。
+            PRINT_LEGACY_TAIL_DETAIL = False
             if best_snapshots:
-                final_cbf = copy.deepcopy(best_vessel_for_group.cbf)
-                unified_tail_list = build_unified_tail_list(
-                    best_vessel_for_group, final_cbf, best_snapshots, original_cbf
-                )
-                host_pool = scan_host_candidates(best_vessel_for_group, best_snapshots)
-                placements, unplaced = match_tails_to_hosts(
-                    unified_tail_list, host_pool,
-                    best_vessel_for_group.port_min, best_vessel_for_group.n_ports)
-
-                tail_total = sum(rec["count"] for rec in unified_tail_list)
-                placed_total = sum(p["count"] for p in placements)
-                unplaced_total = sum(u["count"] for u in unplaced)
-                print(f"  📦 {group_name} 组最优(种子{b['seed']}) 尾箱安置台账(旧口径): "
-                      f"尾箱合计={tail_total}, 已安置={placed_total}, 未安置={unplaced_total}")
-
-                # 新口径("最终结果 vs 原始demand"一次性比较，见utils/tail.py
-                # build_tail_container_list docstring)：跟旧口径(来源1+2+3独立
-                # 相加)算的是同一件事的两种口径，先并排打印做对比观察，不直接
-                # 替换旧口径的安置流程(unified_tail_list仍然是喂给
-                # match_tails_to_hosts的那份)——等确认新口径在这份真实数据上
-                # 稳定可信后，再考虑把上面的unified_tail_list换成new_tail_list。
                 new_tail_list = build_tail_container_list(
                     best_vessel_for_group, best_snapshots, original_cbf
                 )
                 new_tail_total = sum(rec["count"] for rec in new_tail_list)
+
+                host_pool = scan_host_candidates(best_vessel_for_group, best_snapshots)
+                placements, unplaced = match_tails_to_hosts(
+                    new_tail_list, host_pool,
+                    best_vessel_for_group.port_min, best_vessel_for_group.n_ports)
+                placed_total = sum(p["count"] for p in placements)
+                unplaced_total = sum(u["count"] for u in unplaced)
+
                 print(f"  📦 {group_name} 组最优(种子{b['seed']}) 尾箱统计(新口径): "
-                      f"尾箱合计={new_tail_total} (旧口径={tail_total}, "
-                      f"差异={new_tail_total - tail_total:+d})")
+                      f"尾箱合计={new_tail_total}, 已安置={placed_total}, 未安置={unplaced_total}")
 
                 print_tail_by_port(new_tail_list, original_cbf, port_names=PORT_NAMES, label="新口径")
-                print_tail_by_port(unified_tail_list, original_cbf, port_names=PORT_NAMES, label="旧口径")
+
+                if placements:
+                    tail_bayplan_dir = os.path.join(BAYPLAN_DIR, "tail_fill")
+                    plot_tail_before_after(
+                        best_vessel_for_group, best_snapshots, original_cbf, placements,
+                        tail_bayplan_dir, port_names=PORT_NAMES,
+                    )
+
+                if PRINT_LEGACY_TAIL_DETAIL:
+                    # final_cbf必须在build_unified_tail_list(内部会调用
+                    # proj_cell_to_vessel写回best_vessel_for_group.cbf)之前
+                    # 深拷贝，理由同utils/tail.py里的同款注释：来源1读的是
+                    # proj_cell_to_vessel执行前的cbf切面。
+                    final_cbf = copy.deepcopy(best_vessel_for_group.cbf)
+                    unified_tail_list = build_unified_tail_list(
+                        best_vessel_for_group, final_cbf, best_snapshots, original_cbf
+                    )
+                    legacy_tail_total = sum(rec["count"] for rec in unified_tail_list)
+                    print(f"  📦 {group_name} 组最优(种子{b['seed']}) 尾箱安置台账(旧口径): "
+                          f"尾箱合计={legacy_tail_total}")
+                    print_tail_by_port(unified_tail_list, original_cbf, port_names=PORT_NAMES, label="旧口径")
+                else:
+                    print(f"  📦 旧口径明细见debug/tail_new_old.py（默认不打印，"
+                          f"PRINT_LEGACY_TAIL_DETAIL=True可恢复）")
 
         # discharge_spread组级汇总（所有POD×所有种子拉平算均值，不逐POD逐种子明细）
         if spread_variances:
@@ -268,7 +324,9 @@ def main():
     print(df_summary.to_string(index=False))
 
     # 你可以在这里导出最优解的 bayplan:
-    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES, if_csv=False, if_plot_phy=False)
+    
+    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES,
+                                          if_csv=False, if_plot_phy=False, cbf_with_20=cbf_with_20)
 
 if __name__ == "__main__":
     main()

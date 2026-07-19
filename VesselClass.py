@@ -414,15 +414,19 @@ class Vessel:
         capacity_rf = Vessel.build_vessel_cell(slots, "can_reefer_40ft")
         return is_valid, capacity_total, capacity_rf
 
-    def proj_cell_to_vessel(self, cell_state=None, original_cbf=None) -> pd.DataFrame:
+    def proj_cell_to_vessel(self, cell_state=None, original_cbf=None, cbf_with_20=None) -> pd.DataFrame:
         """
         cell级解 -> slot级DataFrame投影。
         cell_state: 不传则用当前self.cell；传则接受snapshot()格式的dict（取其"cell"）。
         original_cbf: 航次开始前（solve()扣减之前）的原始cbf，用于按(POL,POD)读取
                       HC/HR原始总demand，作为贴HC标签的预算池来源（见下）。
+        cbf_with_20: 可选，vessel_io.batch_parse_cbf_with_20的输出格式（int-keyed
+                     {POL:{POD:{"20GP":n,"20HC":n,...}}}，跟original_cbf一样由调用方
+                     从json加载后把key转成int）。不传则跳过第三步20ft relabel，
+                     is_20ft保持全False，不影响任何现有调用方。
 
         返回列：bay_idx, row_idx, tier_idx, lr, hd, can_40ft, can_20ft, can_reefer,
-               POL, POD, GP_count, RF_count, is_hc
+               POL, POD, GP_count, RF_count, is_hc, is_20ft（默认恒False，见第三步）
 
         分配到具体物理槽位的规则（cell级解 -> slot级的合理近似复原，
         不是真实精确到箱位的CSP解，只是按装载习惯把cell总量摊到槽位上，
@@ -434,9 +438,8 @@ class Vessel:
             3. 摊不满的槽位，POD保持-1。
 
         第二步（贴HC标签）：预算池按(POL,POD)粒度，取original_cbf里这个POL/POD
-        的原始HC/HR总demand（不用record["_gp_from_hc"]/["_rf_from_hr"]——那两个
-        只是assign()记账顺序的副产品，只服务unassign()回滚，不代表这个cell该
-        负责发多少高箱名额）。RF预算(rf_hc_budget)和GP预算(gp_hc_budget)分开走，
+        的原始HC/HR总demand
+        RF预算(rf_hc_budget)和GP预算(gp_hc_budget)分开走，
         但共享同一套摞级配额quota(n)（_stack_hc_cap，hold/deck统一公式）和同一个
         occupied集合判断逻辑，贴标顺序沿用先RF后GP。按(POL,POD)分组后，把该组
         占用的所有摞（跨host cell合并）按hd拆成hold摞/deck摞两批，分四步分配：
@@ -454,6 +457,17 @@ class Vessel:
                 直到预算耗尽或hold摞用尽（不限次数，不要求GP需求为0才触发）。
             Step4：分不完的gp_hc_budget/rf_hc_budget回退进cbf余量。
         排序用贪心（quota(n)降序），不做背包最优匹配。
+
+        第三步（post-solve 20ft relabel，纯打标签，不改GP_count/RF_count/POD/POL/is_hc）：
+        cbf_with_20非None时才跑。按record["POL"]（不是本函数外层调用方遍历到的导出快照
+        POL——同一批未卸货物会原样出现在装船后所有后续POL快照里，只有record["POL"]即这批
+        货实际装船港才能对上cbf_with_20的需求量，跟第二步HC贴标签用info["pol"]=record["POL"]
+        是同一原则）分组，每组floor((20GP+20HC)/2)（HC不单独区分，一视同仁并入GP）= 需要
+        relabel成"20ft对"的cell数量，只在b0侧（bay_idx==b0）、POL/POD匹配、GP_count==1
+        （is_hc不管）的slot里选，按(big_bay,lr,hd)自然顺序分组、组内按(tier_idx,row_idx)
+        升序挑选，选满一组的quota用完为止；选中的b0侧slot镜像同步到b1侧同(row,tier)位置。
+        候选池不够用（正常不应发生，40ft GP_count本身就是20ft折算来的）时不报错，直接
+        跳过剩余数量，留给调用方/校验脚本核对。
         """
         if self.full_slot_table is None:
             raise ValueError("此Vessel无full_slot_table，无法投影，需通过Vessel.load_vessel()构造")
@@ -468,6 +482,10 @@ class Vessel:
         slots["GP_count"] = 0
         slots["RF_count"] = 0
         slots["is_hc"] = False
+        # 预留给post-solve补丁模块：把某个已分配的40ft cell relabel成2个独立20ft箱时，
+        # 用这一列标记哪些槽位属于被拆分出的20ft箱。当前proj_cell_to_vessel完全没有
+        # 拆分逻辑，这一列恒为False，纯占位。
+        slots["is_20ft"] = False
 
         cell_infos = []  # 供第二步HC贴标使用，按(POL,POD)分组
 
@@ -492,19 +510,59 @@ class Vessel:
                     # lr=0这一侧假设row_idx越大越靠中线(降序=从中间到两边)，
                     # lr=1这一侧假设row_idx越小越靠中线(升序=从中间到两边)——
                     # 如果实际方向反了，把下面row_reverse的条件互换即可。
+                    #
+                    # 按row(摞)为单位顺序分摊，不能用一个跨row的全局tier排序
+                    # 统一切片：不同row的tier_idx取值范围可能完全不重叠(例如
+                    # 一个row是4-7、另一个row是0-3)，如果对整个cell的槽位按
+                    # 绝对tier_idx全局排序后统一做reefer_idx[:rf_count]/
+                    # remaining_idx[:gp_count]前缀切片，会出现某个row自己的
+                    # 低tier在全局排序里排到后面、被别的row先抢走预算，而这个
+                    # row自己更高的tier在全局序列里反而排到前面被填上——产生
+                    # 摞内tier不连续的物理不可能状态(低tier空、高tier占用)。
+                    # 于是改成：先分row、按row_reverse定的"从中间到两侧"顺序把
+                    # row排好处理序列；rf_count/gp_count是这个cell所有row共享
+                    # 的预算，严格按row顺序逐个处理——每个row先从can_reefer槽位
+                    # 里(row内tier_idx升序)吃掉min(该row reefer槽位数,剩余
+                    # rf_count)，再从row剩下的槽位(同样tier_idx升序)吃掉
+                    # min(该row剩余槽位数,剩余gp_count)；哪个row没被这两步
+                    # 填满(说明预算已在这个row耗尽)，从这个row往后的所有row
+                    # 都不再分配——不允许后面的row插队使用本该属于前面某个
+                    # row的预算，从而保证每个row内部占用一定是从最低tier开始
+                    # 连续的一段。
                     row_reverse = (lr == 0)
-                    cell_idx.sort(key=lambda idx: (
-                        slots.at[idx, "tier_idx"],
-                        -slots.at[idx, "row_idx"] if row_reverse else slots.at[idx, "row_idx"],
-                    ))
+                    dist_row_groups = {}
+                    for idx in cell_idx:
+                        dist_row_groups.setdefault(slots.at[idx, "row_idx"], []).append(idx)
+                    for row_idx, idx_list in dist_row_groups.items():
+                        idx_list.sort(key=lambda idx: slots.at[idx, "tier_idx"])
+                    dist_row_order = sorted(
+                        dist_row_groups.keys(),
+                        key=lambda r: (-r if row_reverse else r),
+                    )
 
-                    # 第一步：只在can_reefer=True的槽位里摊RF需求
-                    reefer_idx = [idx for idx in cell_idx if slots.at[idx, "can_reefer"]]
-                    used_rf_idx = reefer_idx[:rf_count]
+                    used_rf_idx, used_gp_idx = [], []
+                    rf_remaining, gp_remaining = rf_count, gp_count
+                    for row_idx in dist_row_order:
+                        if rf_remaining <= 0 and gp_remaining <= 0:
+                            break
+                        row_idx_list = dist_row_groups[row_idx]
 
-                    # 第二步：剩下所有槽位（含没被RF用到的reefer槽位）摊GP需求
-                    remaining_idx = [idx for idx in cell_idx if idx not in used_rf_idx]
-                    used_gp_idx = remaining_idx[:gp_count]
+                        row_reefer_idx = [idx for idx in row_idx_list if slots.at[idx, "can_reefer"]]
+                        take_rf = min(len(row_reefer_idx), rf_remaining)
+                        row_used_rf = row_reefer_idx[:take_rf]
+
+                        row_remaining_idx = [idx for idx in row_idx_list if idx not in row_used_rf]
+                        take_gp = min(len(row_remaining_idx), gp_remaining)
+                        row_used_gp = row_remaining_idx[:take_gp]
+
+                        used_rf_idx.extend(row_used_rf)
+                        used_gp_idx.extend(row_used_gp)
+                        rf_remaining -= take_rf
+                        gp_remaining -= take_gp
+
+                        if take_rf + take_gp < len(row_idx_list):
+                            # 这个row没填满，预算已耗尽——后续row不再分配
+                            break
 
                     for idx in used_rf_idx:
                         slots.at[idx, "POL"] = pol
@@ -539,7 +597,12 @@ class Vessel:
                         "used_gp_set": set(used_gp_idx),
                     })
 
-                    # b1侧：镜像写回GP/RF计数，(row_idx,tier_idx)与b0侧完全一致
+                    # b1侧：镜像写回GP/RF计数，(row_idx,tier_idx)与b0侧完全一致。
+                    # b0/b1写入相同的POD是当前实现的选择（因为一个40ft箱天然占用
+                    # 镜像的两个20ft物理位置），不是slot级表结构的硬约束——这张表
+                    # 本身是逐20ft-slot记录的，将来如果要把某个40ft cell拆成两个
+                    # 独立20ft箱（可能分给不同POD），完全可以把这里改成b0/b1各自
+                    # 独立写入，不需要改表结构，只需要改这段赋值逻辑本身。
                     used_idx = used_rf_idx + used_gp_idx
                     if not used_idx:
                         continue
@@ -566,8 +629,26 @@ class Vessel:
         for (pol, pod), infos in pod_groups.items():
             # 同一个(POL,POD)分组在被discharge之前会原样出现在后续每个POL的
             # snapshot里，is_hc贴标签本身可以每次都重算(幂等)，但写回self.cbf
-            # 这个副作用只能对同一分组生效一次，否则会被重复计入。
+            # 这个副作用只能对同一分组生效一次，否则会被重复计入——写回方式
+            # 已经从"多次+="改成"一次性总账赋值"，重复生效的风险也从"多算几次
+            # +=1"变成"拿本次调用已经写过的最终值当baseline、在上面再叠加一次
+            # gp_released_count/gp_hc_budget"，同样会出错，所以这层去重依然
+            # 必须保留，只是保护对象变了（见下面baseline_hc/baseline_hr的注释）。
             already_written = (pol, pod) in self._hc_cbf_writeback_seen
+
+            # 总账公式的起点：这个分组开始处理前，self.cbf里已有的残量("来源1"
+            # tail_threshold尾量，solve()结束、任何proj_cell_to_vessel调用之前
+            # 就存在)。必须在本次调用对这个分组做任何写回之前读取——同一分组
+            # 只会真正写回一次(already_written保护)，所以只有第一次调用时这里
+            # 读到的才是真正的"处理前"基线；重复调用时这个值已经是上一次算出的
+            # 最终结果，但反正下面的写回也会被already_written跳过，不会用错。
+            cbf_demand_before = self.cbf[pol][pod]
+            baseline_hc = cbf_demand_before.get("HC", 0)
+            baseline_hr = cbf_demand_before.get("HR", 0)
+            # 总账公式的另外两项：这个分组释放的leftover slot数，按释放前是GP
+            # 来源还是RF来源分开累计，取代原来_settle_row里逐次的self.cbf+=1。
+            gp_released_count = 0
+            rf_released_count = 0
 
             demand = original_cbf.get(pol, {}).get(pod, {})
             gp_hc_budget = demand.get("HC", 0)
@@ -622,72 +703,93 @@ class Vessel:
 
                 return take_rf + take_gp
 
-            def _settle_leftover_gp(stack):
-                """贴完这一摞的HC quota后，摞里剩下没被贴上HC标签的GP槽位，
-                逐个核对gp_true_budget：预算>0则消耗1个、合法保留为真GP；
-                预算==0说明这个slot的真实身份其实是HC借位(不是真GP)，就地
-                物理清空(POD/POL/GP_count/RF_count/is_hc全部重置)，并把1
-                单位退回self.cbf[pol][pod]["HC"]（不是"GP"）。清空的slot从
-                stack["used_gp"]里移除，避免后续(Step3二次扫描)把一个已经
-                物理清空的slot误当成可贴HC标签的候选。
+            def _settle_row(stack):
+                """联合结算这一摞(row)里没被贴上HC标签的GP+RF槽位——GP/RF
+                合并处理，不再各自独立决定去留，避免同一row内两者各自结算
+                互不知情、导致低tier(比如恰好被RF占用)被释放而高tier(被GP
+                占用)却保留下来的物理不可能悬空态(per-row分摊已经保证RF/
+                GP不会跨row交错，所以这里的协调只需要限定在单个row内部)。
 
-                gp_hc_budget/rf_hc_budget在整个(POL,POD)分组的处理过程中只
-                会单调递减、不会回补，所以一个摞在被Step1/Step2/Step3任一步
-                实际处理(调用过_tag_stack)之后，它当下没被贴上HC标签的occupied
-                slot就已经是最终结果——不会有"budget后来又变宽裕了"的情况，
-                可以立即结算，不需要等所有step跑完再统一处理。"""
-                nonlocal gp_true_budget
-                leftover = [idx for idx in stack["used_gp"] if idx not in stack["hc_tagged"]]
-                for idx in leftover:
-                    if gp_true_budget > 0:
-                        gp_true_budget -= 1
-                        continue
+                kept_rf/kept_gp的计算方式跟原来独立版完全一致：各自把
+                leftover(未被贴HC标签的occupied slot)跟rf_true_budget/
+                gp_true_budget比较，min(leftover数, 预算)个"合法保留为真
+                GP/RF"，预算不受"两个HC/RF预算池是否已耗尽"提前退出条件
+                限制，budget只降不升，一旦被这个(POL,POD)分组处理过就是
+                最终结果，可以立即结算。
+
+                跟独立版的区别在于物理slot的保留/释放决定：把这一摞leftover
+                的GP+RF物理slot合并、按tier_idx从低到高排序，只保留最底部
+                keep_count=kept_rf+kept_gp个，其余(更高tier的)全部释放
+                (POD/POL/GP_count/RF_count/is_hc清空)，按slot原本的类型
+                (释放前是RF还是GP)累加进外层gp_released_count/rf_released_count
+                （不再直接写self.cbf——分组循环结束后用baseline_hc/baseline_hr+
+                released_count+leftover budget的总账公式一次性赋值，见调用方）。
+                保留区间内
+                同样从最底部开始，优先把can_reefer=True的slot贴上RF(最多
+                kept_rf个)，其余保留slot贴GP——同一物理slot的类型可能因此
+                从GP变成RF或反过来，GP_count/RF_count要跟着同步更新，避免
+                字段和实际类型对不上。结算完把stack["used_rf"]/["used_gp"]
+                更新为保留区间内实际最终的类型划分，供Step3二次扫描/HC
+                镜像使用。"""
+                nonlocal gp_true_budget, rf_true_budget, gp_released_count, rf_released_count
+                leftover_rf = [idx for idx in stack["used_rf"] if idx not in stack["hc_tagged"]]
+                leftover_gp = [idx for idx in stack["used_gp"] if idx not in stack["hc_tagged"]]
+                leftover_rf_set = set(leftover_rf)
+
+                kept_rf = min(len(leftover_rf), rf_true_budget)
+                kept_gp = min(len(leftover_gp), gp_true_budget)
+                rf_true_budget -= kept_rf
+                gp_true_budget -= kept_gp
+                keep_count = kept_rf + kept_gp
+
+                pool = leftover_rf + leftover_gp
+                pool.sort(key=lambda idx: slots.at[idx, "tier_idx"])
+                keep_slots = pool[:keep_count]
+                release_slots = pool[keep_count:]
+
+                def _mirror_idxs(idx):
                     b1 = stack["info"]["b1"]
-                    release_row = slots.at[idx, "row_idx"]
-                    release_tier = slots.at[idx, "tier_idx"]
-                    for target_idx in [idx] + list(slots.index[
+                    row_i = slots.at[idx, "row_idx"]
+                    tier_i = slots.at[idx, "tier_idx"]
+                    return [idx] + list(slots.index[
                         (slots.bay_idx == b1)
-                        & (slots.row_idx == release_row)
-                        & (slots.tier_idx == release_tier)
-                    ]):
+                        & (slots.row_idx == row_i)
+                        & (slots.tier_idx == tier_i)
+                    ])
+
+                rf_assigned = 0
+                for idx in keep_slots:
+                    if rf_assigned < kept_rf and bool(slots.at[idx, "can_reefer"]):
+                        for target_idx in _mirror_idxs(idx):
+                            slots.at[target_idx, "RF_count"] = 1
+                            slots.at[target_idx, "GP_count"] = 0
+                        rf_assigned += 1
+                    else:
+                        for target_idx in _mirror_idxs(idx):
+                            slots.at[target_idx, "GP_count"] = 1
+                            slots.at[target_idx, "RF_count"] = 0
+
+                for idx in release_slots:
+                    was_rf = idx in leftover_rf_set
+                    for target_idx in _mirror_idxs(idx):
                         slots.at[target_idx, "POL"] = -1
                         slots.at[target_idx, "POD"] = -1
                         slots.at[target_idx, "GP_count"] = 0
                         slots.at[target_idx, "RF_count"] = 0
                         slots.at[target_idx, "is_hc"] = False
-                    stack["used_gp"].remove(idx)
-                    if not already_written:
-                        cbf_demand = self.cbf[pol][pod]
-                        cbf_demand["HC"] = cbf_demand.get("HC", 0) + 1
+                    # 不再直接写self.cbf——只在内存里累计这个分组释放了多少个
+                    # GP来源/RF来源的slot，真正的self.cbf写回挪到分组循环结束后
+                    # 的总账公式一次性完成（见下方baseline_hc/baseline_hr那段）。
+                    # 这里不需要already_written保护：计数本身跟is_hc贴标签一样
+                    # 是幂等的纯计算，重复调用也只是重算出同样的数字，真正的
+                    # 副作用(写self.cbf)由末尾唯一一处already_written保护。
+                    if was_rf:
+                        rf_released_count += 1
+                    else:
+                        gp_released_count += 1
 
-            def _settle_leftover_rf(stack):
-                """跟_settle_leftover_gp完全对称，只是对象换成reefer摞里没被
-                贴上HC标签的RF槽位，预算池换成rf_true_budget，退回目标换成
-                self.cbf[pol][pod]["HR"]（这个slot的真实身份是HR借reefer
-                占位，不是真RF）。"""
-                nonlocal rf_true_budget
-                leftover = [idx for idx in stack["used_rf"] if idx not in stack["hc_tagged"]]
-                for idx in leftover:
-                    if rf_true_budget > 0:
-                        rf_true_budget -= 1
-                        continue
-                    b1 = stack["info"]["b1"]
-                    release_row = slots.at[idx, "row_idx"]
-                    release_tier = slots.at[idx, "tier_idx"]
-                    for target_idx in [idx] + list(slots.index[
-                        (slots.bay_idx == b1)
-                        & (slots.row_idx == release_row)
-                        & (slots.tier_idx == release_tier)
-                    ]):
-                        slots.at[target_idx, "POL"] = -1
-                        slots.at[target_idx, "POD"] = -1
-                        slots.at[target_idx, "GP_count"] = 0
-                        slots.at[target_idx, "RF_count"] = 0
-                        slots.at[target_idx, "is_hc"] = False
-                    stack["used_rf"].remove(idx)
-                    if not already_written:
-                        cbf_demand = self.cbf[pol][pod]
-                        cbf_demand["HR"] = cbf_demand.get("HR", 0) + 1
+                stack["used_rf"] = [idx for idx in keep_slots if slots.at[idx, "RF_count"] == 1]
+                stack["used_gp"] = [idx for idx in keep_slots if slots.at[idx, "GP_count"] == 1]
 
             # ── Step1：hold摞，按quota(n)降序贪心，每摞最多贴quota(n)个。
             # 结算gp_true_budget不受"两个HC/RF预算池是否已耗尽"这个提前退出
@@ -698,8 +800,7 @@ class Vessel:
             for stack in hold_stacks:
                 if not (rf_hc_budget <= 0 and gp_hc_budget <= 0):
                     _tag_stack(stack, stack["quota"])
-                _settle_leftover_gp(stack)
-                _settle_leftover_rf(stack)
+                _settle_row(stack)
 
             # ── Step2：deck摞，按quota(n)降序，整摞转HC(预算够)或收尾摞混装(不够，
             # 只允许触发一次)。"只允许触发一次"只约束贴HC标签这个动作——
@@ -766,8 +867,7 @@ class Vessel:
                         _tag_stack(stack, quota)
                         deck_tail_used = True
 
-                _settle_leftover_gp(stack)
-                _settle_leftover_rf(stack)
+                _settle_row(stack)
 
             # ── Step3：预算仍有剩余，回到hold摞二次扫描（跳过Step1已贴满quota
             # 上限的摞），套用跟Step2收尾摞相同的规则继续贴，不限次数，直到
@@ -779,10 +879,12 @@ class Vessel:
                 if remaining_quota <= 0:
                     continue
                 _tag_stack(stack, remaining_quota)
-                _settle_leftover_gp(stack)
-                _settle_leftover_rf(stack)
+                _settle_row(stack)
 
-            # b1侧：镜像is_hc标签，(row_idx,tier_idx)与b0侧完全一致
+            # b1侧：镜像is_hc标签，(row_idx,tier_idx)与b0侧完全一致。同上——
+            # 这里镜像的前提是b0/b1两侧共享同一个POD（一个40ft箱占用镜像的两个
+            # 20ft物理位置），不是表结构强制的；这张表逐20ft-slot记录，未来拆分
+            # 40ft cell成两个独立20ft箱时，is_hc同样可以按各自的箱身独立贴标。
             for stack in hold_stacks + deck_stacks:
                 if not stack["hc_tagged"]:
                     continue
@@ -800,27 +902,86 @@ class Vessel:
                 # 预算池分不完——跟deck-squeeze一样是幂等的计算结果，每次
                 # proj_cell_to_vessel重算这个(POL,POD)分组都会得到同样的
                 # gp_hc_budget/rf_hc_budget，所以每次触发都记一笔（不受
-                # already_written限制），真正写回self.cbf才需要去重一次。
+                # already_written限制），真正写回self.cbf才需要去重一次。这段
+                # 记录时机不受下面写回方式重构的影响：gp_hc_budget/rf_hc_budget
+                # 在Step1/2/3结束后就是最终的leftover值，跟总账公式用的是
+                # 同一份数字，只是总账公式把它跟baseline/released_count合并
+                # 一起赋值，不再单独写一次self.cbf，日志本身照常按老条件触发。
                 self._tail_source3_log.append((pol, pod, gp_hc_budget, rf_hc_budget))
 
-            if not already_written and (gp_hc_budget > 0 or rf_hc_budget > 0):
-                # 把这部分HC/HR demand回退进cbf余量，跟真正没找到地方放的
-                # 尾货合并存放。
+            if not already_written:
+                # 总账公式：一次性把这个(POL,POD)分组最终的HC/HR余量算出来，
+                # 取代原来_settle_row逐次+=和这里leftover单独+=两条独立写回
+                # 路径——三项加总正好是完整的账：baseline(分组处理前self.cbf
+                # 里的残量) + 本组settle_row释放的leftover slot数(按GP/RF来源
+                # 分开) + budget池分不完的leftover。赋值本身天然幂等，
+                # already_written只是防止拿本次调用已经写过的最终值当baseline
+                # 重复叠加，不是防止"重复+="（已经没有+=了）。
                 cbf_demand = self.cbf[pol][pod]
-                cbf_demand["HC"] = cbf_demand.get("HC", 0) + gp_hc_budget
-                cbf_demand["HR"] = cbf_demand.get("HR", 0) + rf_hc_budget
+                cbf_demand["HC"] = baseline_hc + gp_released_count + gp_hc_budget
+                cbf_demand["HR"] = baseline_hr + rf_released_count + rf_hc_budget
 
             self._hc_cbf_writeback_seen.add((pol, pod))
 
-        return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
-                      "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count", "is_hc"]]
+        # 第三步：post-solve 20ft relabel（见上方docstring）。不改GP_count/RF_count/
+        # POD/POL/is_hc，只在最终已定型的slots状态上打is_20ft标签。
+        if cbf_with_20 is not None:
+            pol_pod_pairs = set(
+                zip(slots.loc[slots.POD != -1, "POL"], slots.loc[slots.POD != -1, "POD"])
+            )
+            for pol, pod in sorted(pol_pod_pairs):
+                demand20 = cbf_with_20.get(pol, {}).get(pod, {})
+                pairs_needed = (demand20.get("20GP", 0) + demand20.get("20HC", 0)) // 2
+                if pairs_needed <= 0:
+                    continue
 
-    def export_bayplan(self, snapshots: dict, out_dir: str, original_cbf: dict, port_names: dict = None, if_csv: bool = False, if_plot_phy: bool = False) -> list:
+                for big_bay, (b0, b1) in enumerate(STSE_BAY_PAIRS):
+                    if pairs_needed <= 0:
+                        break
+                    for lr in (0, 1):
+                        if pairs_needed <= 0:
+                            break
+                        for hd in (0, 1):
+                            if pairs_needed <= 0:
+                                break
+                            group_mask = (
+                                (slots.bay_idx == b0) & (slots.lr == lr) & (slots.hd == hd)
+                                & (slots.POL == pol) & (slots.POD == pod) & (slots.GP_count == 1)
+                                & (~slots.is_20ft)
+                            )
+                            group_idx = list(slots.index[group_mask])
+                            group_idx.sort(key=lambda idx: (
+                                slots.at[idx, "tier_idx"], slots.at[idx, "row_idx"],
+                            ))
+                            take_idx = group_idx[:pairs_needed]
+                            for idx in take_idx:
+                                slots.at[idx, "is_20ft"] = True
+                                release_row = slots.at[idx, "row_idx"]
+                                release_tier = slots.at[idx, "tier_idx"]
+                                for mirror_idx in slots.index[
+                                    (slots.bay_idx == b1)
+                                    & (slots.row_idx == release_row)
+                                    & (slots.tier_idx == release_tier)
+                                ]:
+                                    slots.at[mirror_idx, "is_20ft"] = True
+                            pairs_needed -= len(take_idx)
+
+                if pairs_needed > 0:
+                    print(f"[proj_cell_to_vessel][20ft relabel] POL={pol} POD={pod} "
+                          f"候选GP slot不够，缺 {pairs_needed} 对(={pairs_needed * 2}个20ft箱)未能relabel")
+
+        return slots[["bay_idx", "row_idx", "tier_idx", "lr", "hd",
+                      "can_40ft", "can_20ft", "can_reefer", "POL", "POD", "GP_count", "RF_count", "is_hc",
+                      "is_20ft"]]
+
+    def export_bayplan(self, snapshots: dict, out_dir: str, original_cbf: dict, port_names: dict = None, if_csv: bool = False, if_plot_phy: bool = False, cbf_with_20: dict = None) -> list:
         """
         遍历snapshots（solve()产出的{POL: snapshot_dict}），对每个POL调用proj_cell_to_vessel，
         存成{POL}_{港口码}_DEP_bayplan.csv，同时调用utils.viz.plot_bayplan画一张png，
         都落盘到out_dir，返回写出的文件路径列表（csv和png交替）。
         port_names: 可选{POL: 三字码}，不传则用POL数字编号命名。
+        cbf_with_20: 可选，原样透传给proj_cell_to_vessel做第三步20ft relabel
+                     （见proj_cell_to_vessel docstring）；不传则不relabel，行为不变。
 
         导出前先打印各POL剩余的cbf（GP/RF计数非0的部分），纯诊断信息：
         可能是capacity取整产生的余量（正数=没放完，负数=capacity超出实际需求的超额扣减），
@@ -851,7 +1012,7 @@ class Vessel:
 
         for pol in sorted(snapshots.keys()):
             code = port_names.get(pol, str(pol)) if port_names else str(pol)
-            df = self.proj_cell_to_vessel(cell_state=snapshots[pol], original_cbf=original_cbf)
+            df = self.proj_cell_to_vessel(cell_state=snapshots[pol], original_cbf=original_cbf, cbf_with_20=cbf_with_20)
             if if_csv:
                 csv_path = os.path.join(out_dir, f"{pol}_{code}_DEP_bayplan.csv")
                 df.to_csv(csv_path, index=False)
