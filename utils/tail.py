@@ -85,7 +85,8 @@ def build_test_scenario():
     return vessel, vessel_init
 
 
-def build_tail_container_list(vessel: Vessel, snapshots: dict, original_cbf: dict) -> list:
+def build_tail_container_list(vessel: Vessel, snapshots: dict, original_cbf: dict,
+                               proj_override: dict = None) -> list:
     """尾箱统计：对original_cbf里出现过的每个(POL,POD)，做一次性的
     "最终结果 vs 原始demand"比较，直接算出真实缺口。
 
@@ -124,13 +125,21 @@ def build_tail_container_list(vessel: Vessel, snapshots: dict, original_cbf: dic
 
     返回list[dict]，每条{"POL","POD","type","count","source"}，count>0，
     source统一标注"final_vs_original"。
+
+    proj_override: 可选，{POL: slot级DataFrame}。传入时对应POL跳过重新投影，
+    直接用这份DataFrame统计——供retrofit_tail_placements产出的叠加尾箱后的
+    slot状态复用本函数重新核算缺口，不用改调用方自己写一遍统计逻辑。不传
+    (默认None)时行为跟原来完全一样，每个POL都重新调用proj_cell_to_vessel。
     """
     proj_vessel = copy.deepcopy(vessel)
     proj_cache = {}
     for snap_pol in sorted(snapshots.keys()):
-        proj_cache[snap_pol] = proj_vessel.proj_cell_to_vessel(
-            cell_state=snapshots[snap_pol], original_cbf=original_cbf
-        )
+        if proj_override is not None and snap_pol in proj_override:
+            proj_cache[snap_pol] = proj_override[snap_pol]
+        else:
+            proj_cache[snap_pol] = proj_vessel.proj_cell_to_vessel(
+                cell_state=snapshots[snap_pol], original_cbf=original_cbf
+            )
 
     pol_pod_pairs = sorted(
         (pol, pod)
@@ -183,64 +192,22 @@ def build_tail_container_list(vessel: Vessel, snapshots: dict, original_cbf: dic
 
 def scan_host_candidates(vessel: Vessel, snapshots: dict) -> dict:
     """
-    任务2b：遍历snapshots所有POL快照的cell，按(bay,lr,hd,POL,POD)去重收集
-    host候选池，并计算每个host的静态headroom（GP/RF/HC三种名额还能再放多少）。
+    遍历snapshots所有POL快照的cell，按(bay,lr,hd,POL,POD)去重收集host候选池。
 
-    与vessel.cbf_original无关——不看demand侧，只看已经装到船上的host cell
-    还剩多少物理空间，供2c阶段做尾箱-host匹配用。
+    不再预先算精确的headroom数字（旧的gp_headroom/rf_headroom/hc_headroom
+    公式已整体删除）——"这个row还有没有物理空间可以塞"改成retrofit现场用
+    _row_slot_state从当前slot状态里现算available_idx是否非空来判断，这里
+    只负责给出每个host cell在full_slot_table里对应的row(摞)列表，纯静态
+    几何信息，不随snapshot变化。
 
-    hc_headroom修正（原实现的bug）：不能用_tail_source2_log/_tail_source3_log
-    的(POL,POD)分组命中与否一刀切——那两份日志的key只到(POL,POD)，不含
-    (bay,lr,hd)，同一个(POL,POD)完全可能占了不止一个host cell，只有其中
-    真正被贴过HC标签、触发squeeze的那个cell该扣headroom，同组内其它未被
-    动过的cell不该被连坐清零。改为对每张快照真正调用一次
-    proj_cell_to_vessel（拿到slot级is_hc标签），按(big_bay,lr,hd,POL,POD)
-    精确统计这个host实际用掉了几个HC名额（hc_used），hc_headroom=
-    capacity_hc-hc_used，是host cell级的精确值。
-
-    proj_cell_to_vessel会真实写self.cbf（受_hc_cbf_writeback_seen去重保护）、
-    追加_tail_source2_log/_tail_source3_log——这些副作用不该污染调用方传入
-    的vessel实例，所以每张快照都在vessel的一份deepcopy上调用，原vessel和
-    传入的snapshots全程只读。用的是vessel.cbf_original（航次开始前的原始
-    cbf快照，Vessel.__init__已经存了一份，内容等价于其它地方手动deepcopy
-    出来的original_cbf）作为HC贴标签预算池的来源，跟proj_cell_to_vessel
-    在别处的调用口径一致。每张快照只投影一次，同一张快照里的多个host共享
-    这一次调用的结果，不逐host重复投影。
-
-    只读vessel.capacity_total/capacity_rf/capacity_hc/cbf_original和
-    snapshots里的cell记录，不修改传入的self.cell/self.cbf。
-
-    返回dict，key=(bay,lr,hd,POL,POD)，value={"gp_headroom","rf_headroom",
-    "hc_headroom","hd","capacity_total","capacity_rf","capacity_hc"}。
-
-    同一host在不同快照里重复出现时，headroom必须是静态值（HC贴标签逻辑
-    对同一份未discharge的货是幂等的）——这里显式比对，不一致就
-    AssertionError，不静默取任意一份。
+    返回dict，key=(bay,lr,hd,POL,POD)，value={"hd", "rows": [row_idx,...]}
+    （row_idx升序排列，只取full_slot_table里can_40ft、b0侧的行——b1侧是
+    proj_cell_to_vessel镜像出来的重复物理位置，不能重复计数，跟
+    capacity_total/capacity_hc的统计口径一致）。
     """
     candidates = {}
     for snap_pol in sorted(snapshots.keys()):
-        snap = snapshots[snap_pol]
-        cell = snap["cell"]
-
-        # 只读投影：在vessel的deepcopy上跑，避免proj_cell_to_vessel的写回
-        # 副作用（self.cbf/_hc_cbf_writeback_seen/_tail_source2_log/
-        # _tail_source3_log）污染调用方传入的vessel实例。
-        proj_vessel = copy.deepcopy(vessel)
-        slots_df = proj_vessel.proj_cell_to_vessel(cell_state=snap, original_cbf=vessel.cbf_original)
-
-        # 按(big_bay,lr,hd,POL,POD)精确统计这张快照里每个host实际贴了几个
-        # is_hc标签。只认_BIG_BAY_OF_B0能映射到的b0侧行——跟capacity_hc
-        # 本身的统计口径一致（_derive_capacity_hc同样只数b0侧），b1侧是
-        # proj_cell_to_vessel镜像写出来的重复标签，不能重复计数。
-        hc_used_by_host = {}
-        hc_rows = slots_df[(slots_df["POD"] != -1) & slots_df["is_hc"]]
-        for row in hc_rows.itertuples(index=False):
-            big_bay = _BIG_BAY_OF_B0.get(row.bay_idx)
-            if big_bay is None:
-                continue
-            hc_key = (big_bay, row.lr, row.hd, row.POL, row.POD)
-            hc_used_by_host[hc_key] = hc_used_by_host.get(hc_key, 0) + 1
-
+        cell = snapshots[snap_pol]["cell"]
         for bay in range(vessel.n_bay):
             for lr in range(2):
                 for hd in range(2):
@@ -250,36 +217,18 @@ def scan_host_candidates(vessel: Vessel, snapshots: dict) -> dict:
                         continue
                     pol = record["POL"]
                     key = (bay, lr, hd, pol, pod)
-
-                    cap_total = int(vessel.capacity_total[bay, lr, hd])
-                    cap_rf = int(vessel.capacity_rf[bay, lr, hd])
-                    cap_hc = int(vessel.capacity_hc[bay, lr, hd])
-
-                    gp_headroom = cap_total - record["GP_count"] - record["RF_count"]
-                    rf_headroom = cap_rf - record["RF_count"]
-                    hc_used = hc_used_by_host.get(key, 0)
-                    hc_headroom = cap_hc - hc_used
-
-                    entry = {
-                        "gp_headroom": gp_headroom,
-                        "rf_headroom": rf_headroom,
-                        "hc_headroom": hc_headroom,
-                        "hd": hd,
-                        "capacity_total": cap_total,
-                        "capacity_rf": cap_rf,
-                        "capacity_hc": cap_hc,
-                    }
-
                     if key in candidates:
-                        prev = candidates[key]
-                        if prev != entry:
-                            raise AssertionError(
-                                f"[host候选池 静态headroom不一致] host={key} 在不同快照里算出"
-                                f"不同的headroom！之前={prev}, 现在={entry}（同一host的headroom"
-                                f"必须是静态值，出现分歧说明capacity数组或cell记录有问题）"
-                            )
-                    else:
-                        candidates[key] = entry
+                        continue
+
+                    b0 = STSE_BAY_PAIRS[bay][0]
+                    mask = (
+                        (vessel.full_slot_table["bay_idx"] == b0)
+                        & (vessel.full_slot_table["lr"] == lr)
+                        & (vessel.full_slot_table["hd"] == hd)
+                        & vessel.full_slot_table["can_40ft"]
+                    )
+                    rows = sorted(vessel.full_slot_table.loc[mask, "row_idx"].unique().tolist())
+                    candidates[key] = {"hd": hd, "rows": rows}
 
     return candidates
 
@@ -325,14 +274,14 @@ def build_host_discharged_scenario():
 def verify_scan_host_candidates():
     """
     验证scan_host_candidates：
-    1. build_test_scenario()跑一遍，打印全部host候选池内容，人工核对
-       capacity/headroom是否手算一致。
+    1. build_test_scenario()跑一遍，打印全部host候选池内容（现在只含row几何，
+       不再有headroom数字），人工核对row列表是不是跟full_slot_table里这个
+       host cell实际拥有的row数量一致。
     2. build_host_discharged_scenario()验证"host在最终态已discharge、不在
-       self.cell里，但某张早期快照里存在，仍能被正确收进候选池"。
-    3. 跨快照headroom一致性检查——scan_host_candidates内部扫描时已经对每个
-       host做过这个断言，这里额外挑目标host手工跨快照复算，独立验证scan函数
-       本身没有静默吃掉不一致。
-    只做核对+打印，不做host匹配（那是2c的事），不改vessel状态。
+       self.cell里，但某张早期快照里存在，仍能被正确收进候选池"——这条
+       行为跟headroom公式无关，改公式后依然要保持成立。
+    只做核对+打印，不做尾箱匹配（那是retrofit_tail_placements的事），
+    不改vessel状态。
     """
     print("\n" + "=" * 60)
     print("──── scan_host_candidates 验证 ────")
@@ -352,101 +301,48 @@ def verify_scan_host_candidates():
     for key, entry in sorted(pool1.items()):
         print(f"  host={key} -> {entry}")
 
-    if pool1:
-        (bay, lr, hd, pol, pod), entry = sorted(pool1.items())[0]
-        print("\n人工核对示例（挑第一条）：")
-        print(f"  host=(bay={bay}, lr={lr}, hd={hd}, POL={pol}, POD={pod})")
-        print(f"  capacity_total={result_vessel1.capacity_total[bay, lr, hd]}, "
-              f"capacity_rf={result_vessel1.capacity_rf[bay, lr, hd]}, "
-              f"capacity_hc={result_vessel1.capacity_hc[bay, lr, hd]}")
-        print(f"  返回的entry={entry}")
-        print("  手算gp_headroom = capacity_total - GP_count - RF_count、"
-              "rf_headroom = capacity_rf - RF_count，应与上面entry一致（自行核对）")
-
     # ── 2. build_host_discharged_scenario：验证discharge后仍能扫到早期host ──
-    # TODO(已知问题，本次尾箱统计口径修复不处理): 这个场景在_stack_hc_cap公式
-    # 改成n-1后solve()返回success=False（原本假设的最小demand不再能让port
-    # 顺利complete），导致snapshots2为空，下面snapshots2[0]/[1]直接KeyError。
-    # 跟本文件里build_tail_container_list的3组fixture修复无关，需要单独排查
-    # build_host_discharged_scenario的demand/geometry是否也要跟着新公式调整。
     print("\n---- 场景2: build_host_discharged_scenario (验证discharge后仍可扫到) ----")
-    vessel2 = build_host_discharged_scenario()
-    snapshots2 = {}
-    best2 = {"assigned": -1, "vessel": None}
-    success2 = solve(vessel2, is_debug=False, snapshots=snapshots2, best=best2)
-    result_vessel2 = vessel2 if success2 else best2["vessel"]
-    print(f"solve()完成: success={success2}")
-    print(f"snapshots覆盖的POL: {sorted(snapshots2.keys())} (预期含0和1)")
+    try:
+        vessel2 = build_host_discharged_scenario()
+        snapshots2 = {}
+        best2 = {"assigned": -1, "vessel": None}
+        success2 = solve(vessel2, is_debug=False, snapshots=snapshots2, best=best2)
+        result_vessel2 = vessel2 if success2 else best2["vessel"]
+        print(f"solve()完成: success={success2}")
+        print(f"snapshots覆盖的POL: {sorted(snapshots2.keys())} (预期含0和1)")
 
-    target_host = (0, 0, 0, 0, 2)  # (bay,lr,hd,POL,POD)
-    final_cell_record = result_vessel2.cell[0, 0, 0]
-    print(f"最终态 self.cell[0,0,0] = {final_cell_record} (预期POD=-1，已被discharge)")
-    discharged_confirmed = final_cell_record["POD"] == -1
+        target_host = (0, 0, 0, 0, 2)  # (bay,lr,hd,POL,POD)
+        final_cell_record = result_vessel2.cell[0, 0, 0]
+        print(f"最终态 self.cell[0,0,0] = {final_cell_record} (预期POD=-1，已被discharge)")
+        discharged_confirmed = final_cell_record["POD"] == -1
 
-    pod_in_snap0 = snapshots2[0]["cell"][0, 0, 0]["POD"]
-    pod_in_snap1 = snapshots2[1]["cell"][0, 0, 0]["POD"]
-    print(f"snapshots[0]里该cell POD={pod_in_snap0} (预期2)")
-    print(f"snapshots[1]里该cell POD={pod_in_snap1} (预期2，路过港口仍未卸货)")
-    in_snapshot0 = pod_in_snap0 != -1
-    in_snapshot1 = pod_in_snap1 != -1
+        pod_in_snap0 = snapshots2[0]["cell"][0, 0, 0]["POD"]
+        pod_in_snap1 = snapshots2[1]["cell"][0, 0, 0]["POD"]
+        print(f"snapshots[0]里该cell POD={pod_in_snap0} (预期2)")
+        print(f"snapshots[1]里该cell POD={pod_in_snap1} (预期2，路过港口仍未卸货)")
+        in_snapshot0 = pod_in_snap0 != -1
+        in_snapshot1 = pod_in_snap1 != -1
 
-    pool2 = scan_host_candidates(result_vessel2, snapshots2)
-    print(f"scan_host_candidates返回的候选池: {pool2}")
+        pool2 = scan_host_candidates(result_vessel2, snapshots2)
+        print(f"scan_host_candidates返回的候选池: {pool2}")
 
-    host_found = target_host in pool2
-    print(f"目标host={target_host} 是否在候选池里: {host_found} (预期True)")
+        host_found = target_host in pool2
+        print(f"目标host={target_host} 是否在候选池里: {host_found} (预期True)")
 
-    if discharged_confirmed and in_snapshot0 and in_snapshot1 and host_found:
-        print("[OK] 场景2验证通过：host在最终态已discharge(不在self.cell里)，"
-              "但在早期快照(snapshots[0]/[1])里存在，仍被正确收进候选池")
-    else:
-        print(f"[MISMATCH] 场景2验证失败: discharged_confirmed={discharged_confirmed}, "
-              f"in_snapshot0={in_snapshot0}, in_snapshot1={in_snapshot1}, host_found={host_found}")
+        if discharged_confirmed and in_snapshot0 and in_snapshot1 and host_found:
+            print("[OK] 场景2验证通过：host在最终态已discharge(不在self.cell里)，"
+                  "但在早期快照(snapshots[0]/[1])里存在，仍被正确收进候选池")
+        else:
+            print(f"[MISMATCH] 场景2验证失败: discharged_confirmed={discharged_confirmed}, "
+                  f"in_snapshot0={in_snapshot0}, in_snapshot1={in_snapshot1}, host_found={host_found}")
+    except Exception:
+        # 已知问题（跟本次retrofit重写无关，见build_host_discharged_scenario
+        # docstring旁的历史TODO）：不在这里修，只是不让它挡住其它verify函数。
+        import traceback
+        traceback.print_exc()
+        print("[跳过] 场景2出现已知问题，继续")
 
-    if host_found:
-        entry = pool2[target_host]
-        cap_total = int(result_vessel2.capacity_total[0, 0, 0])
-        cap_rf = int(result_vessel2.capacity_rf[0, 0, 0])
-        cap_hc = int(result_vessel2.capacity_hc[0, 0, 0])
-        print(f"目标host的capacity: capacity_total={cap_total}, capacity_rf={cap_rf}, capacity_hc={cap_hc}")
-        print(f"目标host的entry: {entry}")
-        expected_gp_headroom = cap_total - 1 - 0  # GP_count=1(assign装了1个GP), RF_count=0
-        expected_rf_headroom = cap_rf - 0
-        expected_hc_headroom = cap_hc  # 这个场景没有触发过_tail_source2_log/_tail_source3_log
-        headroom_ok = (entry["gp_headroom"] == expected_gp_headroom
-                       and entry["rf_headroom"] == expected_rf_headroom
-                       and entry["hc_headroom"] == expected_hc_headroom)
-        print(f"手算预期: gp_headroom={expected_gp_headroom}, rf_headroom={expected_rf_headroom}, "
-              f"hc_headroom={expected_hc_headroom}")
-        print(f"[{'OK' if headroom_ok else 'MISMATCH'}] 目标host的headroom与手算一致")
-
-    # ── 3. 跨快照headroom一致性检查 ──
-    print("\n---- 3. 跨快照headroom一致性检查 ----")
-    print("scan_host_candidates内部对每个host在多张快照里重复出现时都会比对"
-          "entry是否完全相同，不一致会直接AssertionError（见函数实现）。这里"
-          "额外用snapshots2独立复算一遍target_host在snapshots[0]和snapshots[1]"
-          "里的headroom，验证两份手算结果彼此一致、且都等于scan_host_candidates"
-          "的返回值——不是只信任函数内部断言通过了就算数。")
-
-    def _manual_headroom(vessel, cell_record, bay, lr, hd):
-        cap_total = int(vessel.capacity_total[bay, lr, hd])
-        cap_rf = int(vessel.capacity_rf[bay, lr, hd])
-        gp_headroom = cap_total - cell_record["GP_count"] - cell_record["RF_count"]
-        rf_headroom = cap_rf - cell_record["RF_count"]
-        return gp_headroom, rf_headroom
-
-    gp0, rf0 = _manual_headroom(result_vessel2, snapshots2[0]["cell"][0, 0, 0], 0, 0, 0)
-    gp1, rf1 = _manual_headroom(result_vessel2, snapshots2[1]["cell"][0, 0, 0], 0, 0, 0)
-    print(f"snapshots[0]手算: gp_headroom={gp0}, rf_headroom={rf0}")
-    print(f"snapshots[1]手算: gp_headroom={gp1}, rf_headroom={rf1}")
-
-    cross_snapshot_ok = (gp0 == gp1 == pool2[target_host]["gp_headroom"]
-                          and rf0 == rf1 == pool2[target_host]["rf_headroom"])
-    if cross_snapshot_ok:
-        print("[OK] 跨快照headroom完全一致，且与scan_host_candidates返回值一致")
-    else:
-        print(f"[MISMATCH] 跨快照headroom不一致: snapshot0=({gp0},{rf0}), "
-              f"snapshot1=({gp1},{rf1}), 函数返回={pool2[target_host]}")
 
 def _dist(pol_from: int, pod: int, port_min: int, n_ports: int) -> int:
     """跟Vessel.rel_rank同一个公式体，只是把self.current_pol换成任意传入的
@@ -459,575 +355,345 @@ def _dist(pol_from: int, pod: int, port_min: int, n_ports: int) -> int:
     return (p - c) if p >= c else (p - c + n_ports)
 
 
-def match_tails_to_hosts(unified_tail_list, host_pool, port_min: int, n_ports: int):
+def _host_compatible(host_key, deck_info, pol_t: int, pod_t: int, port_min: int, n_ports: int) -> bool:
     """
-    任务2c：把unified_tail_list里的尾箱记录逐条匹配进host_pool，产出安置台账。
+    判断尾箱[POL_t,POD_t)是否能合法搭进host_key对应的物理cell。
 
-    按交接摘要"已确定的设计原则"逐条实现：
-    - 只匹配同POD的host（尾箱POD必须与host POD完全一致）。
-    - 用_dist()（跟Vessel.rel_rank同一套绕圈感知的相对距离公式）比较host跟
-      尾箱谁离POD更近：要求_dist(host.POL, POD) >= _dist(尾箱.POL, POD)
-      （允许相等）。这条距离规则完全替代了原先"host.POL <= 尾箱.POL"的裸
-      数值比较——host.POL<=尾箱.POL只在航线不绕圈时等价于"host比尾箱先诞生"，
-      在真实环线航次里会既漏判（host自己绕圈、host.POL数值上比尾箱大，但
-      host其实早就存在）又错判（host.POL数值上更小、但它离POD更近，物理上
-      会先于尾箱被discharge、届时尾箱根本借不到它）。距离越大代表离真正
-      discharge越远（还能撑得住更久），所以host的距离必须>=尾箱自己的距离，
-      host才"活得够久"、扛得到尾箱登船那一刻还没被卸货。
-      任务3(apply_tail_placements)里host_life_end要处理的是"这个host在实际
-      快照序列里哪一港真的discharge、注入终点该摆到哪"，是另一个独立问题，
-      这里的距离规则只负责"这次匹配在物理上站不站得住脚"，两者不合并。
-    - GP/RF类型尾箱只消耗对应的gp_headroom/rf_headroom；HC/HR类型尾箱
-      需要同时满足hc_headroom>0且对应gp_headroom/rf_headroom>0（HC看
-      gp_headroom，HR看rf_headroom），取min作为这次能塞的量——HC/HR本身
-      也要占用一个物理槽位，不能只看hc_headroom而忽视host cell根本没有
-      物理空位。
-    - 同一host的headroom被消耗后跨多条尾箱记录累减：在host_pool的本地
-      可变副本（state）上原地扣减，同一个host_key在后续尾箱记录里读到
-      的是上一条记录扣减后的余量，不是host_pool的原始值。
-    - host候选排序：同POD/POL条件满足的host里，优先选headroom更小的
-      （先塞满小空位，把大空位留给后续可能出现的大尾箱）。排序键与该
-      尾箱类型实际消耗的额度口径一致（GP用gp_headroom，RF用rf_headroom，
-      HC用min(hc_headroom,gp_headroom)，HR用min(hc_headroom,rf_headroom)）。
+    host_key=(bay,lr,hd,POL_h,POD_h)。deck_info：host是hold(hd==0)时，同一个
+    (bay,lr)位置deck格子[bay,lr,1]当前的生命周期(POL_d,POD_d)，deck格子空
+    或host本身就是deck(hd==1)时传None。
 
-    只产出台账，不做二次投影：不改vessel.cell/vessel.cbf，host_pool本身
-    也不被就地修改（本地deepcopy一份headroom状态操作）。
+    "谁先谁后"一律用_dist()（等价Vessel.rel_rank，以host自己的POL_h为0起点
+    算相对距离，允许环线绕圈）判断，不用裸数值比较POD——跟get_candidates用
+    rel_rank比较两个POD谁该先卸货是同一个道理。POL_h/POL_t/POL_d本身都是
+    snapshots的真实字典key，航次内单调递增、从不绕圈（Vessel.advance_pol()
+    只会+1），所以两个POL谁先谁后可以直接裸比较，不需要经过rank。
 
-    返回(placements, unplaced)：
-        placements: list[dict]，每条{"POL","POD","type","count","source",
-            "host_bay","host_lr","host_hd","host_POL"}
-        unplaced: list[dict]，匹配不完的尾箱残量，格式同unified_tail_list
-            的条目（count为未安置的剩余量）。
+    hd==1（host是deck）或deck_info为None（host是hold但deck格子空）：退化
+    成嵌套包含规则——host必须不晚于尾箱诞生，且尾箱必须不晚于host卸货：
+        POL_h <= POL_t 且 rank(POD_t) <= rank(POD_h)
+
+    hd==0且deck_info给出deck货物生命周期[POL_d,POD_d)：先决条件（AND，不是
+    可被三选一规则取代的部分）——跟hd==1/deck为空分支同一条基础嵌套检查，
+    尾箱必须首先完整嵌在host cell自己的生命周期以内：
+        POL_h <= POL_t 且 rank(POD_t) <= rank(POD_h)
+    （host自己discharge之后这个物理cell会被重新装货，这条与deck货物是否
+    有货完全无关，漏掉会导致"尾箱跟deck货物关系合法，但尾箱寿命超出host自己
+    会被discharge重新装货的时间点"这种错误匹配。）
+
+    满足上面的前提之后，尾箱还必须跟deck货物完全不相交或完全包住deck货物
+    （partial overlap一律不合法），三种情况取其一：
+        (a) 尾箱完整包住deck货物：POL_t <= POL_d 且 rank(POD_d) <= rank(POD_t)
+        (b) 尾箱完整躲在deck货物之前：rank(POL_t)/rank(POD_t)都落在
+            [POL_h, POL_d]区间内（用rank比较，下界0天然满足）
+        (c) 尾箱完整躲在deck货物之后：rank(POL_t)/rank(POD_t)都落在
+            [POD_d, POD_h]区间内——跟(b)对称，(b)用deck自己的起点POL_d配
+            host自己的起点POL_h做"之前"的右边界，(c)对称地用deck自己的
+            终点POD_d配host自己的终点POD_h做"之后"的左右边界。
     """
-    state = {host_key: dict(entry) for host_key, entry in host_pool.items()}
+    bay, lr, hd, pol_h, pod_h = host_key
+    if pol_h > pol_t:
+        return False
 
-    def _avail(host_state, ctype):
-        if ctype == "GP":
-            return host_state["gp_headroom"]
-        if ctype == "RF":
-            return host_state["rf_headroom"]
-        if ctype == "HC":
-            return min(host_state["hc_headroom"], host_state["gp_headroom"])
-        if ctype == "HR":
-            return min(host_state["hc_headroom"], host_state["rf_headroom"])
-        raise ValueError(f"未知尾箱类型: {ctype}")
+    def rank(port):
+        return _dist(pol_h, port, port_min, n_ports)
 
-    def _deduct(host_state, ctype, take):
-        if ctype == "GP":
-            host_state["gp_headroom"] -= take
-        elif ctype == "RF":
-            host_state["rf_headroom"] -= take
-        elif ctype == "HC":
-            host_state["hc_headroom"] -= take
-            host_state["gp_headroom"] -= take
-        elif ctype == "HR":
-            host_state["hc_headroom"] -= take
-            host_state["rf_headroom"] -= take
+    if hd == 1 or deck_info is None:
+        return rank(pod_t) <= rank(pod_h)
 
-    placements = []
-    unplaced = []
+    # 更基础的前提：不管跟deck货物是哪种关系，尾箱首先必须完整嵌在host cell
+    # 自己的生命周期[POL_h,POD_h)以内——host自己discharge之后这个物理cell
+    # 会被重新装货，跟deck货物完全无关，这条检查不能被下面的三选一规则取代。
+    # POL_h<=POL_t在函数开头已经检查过，这里只需要补上POD_t<=POD_h这一半。
+    if rank(pod_h) < rank(pod_t):
+        return False
 
-    for tail in unified_tail_list:
-        pol, pod, ctype = tail["POL"], tail["POD"], tail["type"]
-        remaining = tail["count"]
-        tail_dist = _dist(pol, pod, port_min, n_ports)
+    pol_d, pod_d = deck_info
 
-        eligible = [
-            (host_key, host_state) for host_key, host_state in state.items()
-            if host_key[4] == pod and _dist(host_key[3], pod, port_min, n_ports) >= tail_dist
-        ]
-        eligible.sort(key=lambda kv: _avail(kv[1], ctype))
-
-        for host_key, host_state in eligible:
-            if remaining <= 0:
-                break
-            avail = _avail(host_state, ctype)
-            if avail <= 0:
-                continue
-            take = min(avail, remaining)
-            _deduct(host_state, ctype, take)
-            placements.append({
-                "POL": pol, "POD": pod, "type": ctype, "count": take,
-                "source": tail.get("source"),
-                "host_bay": host_key[0], "host_lr": host_key[1], "host_hd": host_key[2],
-                "host_POL": host_key[3],
-            })
-            remaining -= take
-
-        if remaining > 0:
-            leftover = dict(tail)
-            leftover["count"] = remaining
-            unplaced.append(leftover)
-
-    return placements, unplaced
+    # (a) 尾箱完整包住deck货物
+    if pol_t <= pol_d and rank(pod_d) <= rank(pod_t):
+        return True
+    # (b) 尾箱完整躲在deck货物之前：[POL_h, POL_d]
+    if rank(pol_t) <= rank(pol_d) and rank(pod_t) <= rank(pol_d):
+        return True
+    # (c) 尾箱完整躲在deck货物之后：[POD_d, POD_h]
+    if rank(pod_d) <= rank(pol_t) <= rank(pod_h) and rank(pod_d) <= rank(pod_t) <= rank(pod_h):
+        return True
+    return False
 
 
-def verify_match_tails_to_hosts():
-    """5个最小合成场景验证match_tails_to_hosts，每个场景各自独立构造
-    tail_list/host_pool（不复用之前的求解场景），跑完打印placements+unplaced，
-    人工核对数字，并assert：
-    - 所有placements的count之和 + 所有unplaced的count之和 == 输入
-      unified_tail_list的count之和（不多不少）。
-    - 每个host被消耗的headroom总量不超过它的初始headroom（不能超装），
-      通过比对消耗前后的state验证。
-    """
+def verify_host_compatible():
+    """单元测试_host_compatible的四类分支：deck host嵌套包含、hold host+空
+    deck退化规则、hold host+deck货物的(a)/(b)/(c)三种合法情形、以及一个
+    partial overlap应被拒绝的反例。port_min=0,n_ports=10，均不涉及绕圈，
+    先验证基础语义；再补一个绕圈场景验证rank()确实在起作用。"""
     print("\n" + "=" * 60)
-    print("──── match_tails_to_hosts 验证 ────")
+    print("──── _host_compatible 验证 ────")
     print("=" * 60)
 
-    def _check(label, tail_list, host_pool, port_min=0, n_ports=10):
-        placements, unplaced = match_tails_to_hosts(tail_list, host_pool, port_min, n_ports)
-        print(f"\n---- 场景: {label} ----")
-        print(f"输入 unified_tail_list: {tail_list}")
-        print(f"输入 host_pool: {host_pool}")
-        print(f"placements: {placements}")
-        print(f"unplaced: {unplaced}")
+    pm, np_ = 0, 10  # 港口编号取值范围[0,9]，host/deck的POD不能取到10(会绕圈折回0)
 
-        input_total = sum(t["count"] for t in tail_list)
-        placed_total = sum(p["count"] for p in placements)
-        unplaced_total = sum(u["count"] for u in unplaced)
-        print(f"输入总数={input_total}, placements总数={placed_total}, unplaced总数={unplaced_total}")
-        assert placed_total + unplaced_total == input_total, \
-            f"[{label}] 箱数对不上账: {placed_total}+{unplaced_total} != {input_total}"
+    cases = [
+        # (label, host_key, deck_info, pol_t, pod_t, expected)
+        ("deck host嵌套包含-刚好相等POD-应通过",
+         (0, 0, 1, 0, 5), None, 1, 5, True),
+        ("deck host嵌套包含-尾箱POD晚于host POD-应拒绝",
+         (0, 0, 1, 0, 5), None, 1, 6, False),
+        ("deck host嵌套包含-host诞生晚于尾箱POL-应拒绝",
+         (0, 0, 1, 3, 5), None, 1, 5, False),
+        ("hold host+空deck-退化成嵌套包含-应通过",
+         (0, 0, 0, 0, 5), None, 1, 5, True),
+        ("hold host+deck货物-(a)尾箱完整包住deck货物-应通过",
+         (0, 0, 0, 0, 9), (3, 6), 1, 8, True),
+        ("hold host+deck货物-(b)尾箱躲在deck货物之前-应通过",
+         (0, 0, 0, 0, 9), (3, 6), 1, 2, True),
+        ("hold host+deck货物-(c)尾箱躲在deck货物之后-应通过",
+         (0, 0, 0, 0, 9), (3, 6), 7, 9, True),
+        ("hold host+deck货物-partial overlap-应拒绝",
+         (0, 0, 0, 0, 9), (3, 6), 4, 8, False),
+        # 回归用例：跟(a)一样"尾箱完整包住deck货物"（POL_t<=POL_d且
+        # rank(POD_d)<=rank(POD_t)），但尾箱POD_t=4晚于host自己的POD_h=2——
+        # host自己会在POD_h=2就被discharge重新装货，物理cell在尾箱寿命内
+        # 已经不再是这个host，必须拒绝。修复前这条会因为三选一规则(a)通过
+        # 而误判为合法，是verify_tail_retrofit_e2e.py端到端脚本里那2个
+        # runtime conflict warning的根因。
+        ("hold host+deck货物-(a)满足但尾箱寿命超出host自己的POD_h-应拒绝",
+         (0, 0, 0, 0, 2), (2, 4), 0, 4, False),
+    ]
 
-        # 每个host消耗量不超过初始headroom：按host_key+字段重算消耗量，
-        # 跟host_pool原始值比对（host_pool本身不应被就地修改）。
-        consumed = {}
-        for p in placements:
-            hk = (p["host_bay"], p["host_lr"], p["host_hd"], p["host_POL"], p["POD"])
-            consumed.setdefault(hk, {"GP": 0, "RF": 0, "HC": 0, "HR": 0})
-            consumed[hk][p["type"]] += p["count"]
+    all_ok = True
+    for label, host_key, deck_info, pol_t, pod_t, expected in cases:
+        actual = _host_compatible(host_key, deck_info, pol_t, pod_t, pm, np_)
+        ok = actual == expected
+        all_ok = all_ok and ok
+        print(f"  [{'OK' if ok else 'MISMATCH'}] {label}: host={host_key}, deck_info={deck_info}, "
+              f"tail=[{pol_t},{pod_t}) -> {actual} (预期{expected})")
 
-        for hk, used in consumed.items():
-            entry = host_pool[hk]
-            gp_used = used["GP"] + used["HC"]
-            rf_used = used["RF"] + used["HR"]
-            hc_used = used["HC"] + used["HR"]
-            assert gp_used <= entry["gp_headroom"], f"[{label}] host={hk} gp超装: {gp_used} > {entry['gp_headroom']}"
-            assert rf_used <= entry["rf_headroom"], f"[{label}] host={hk} rf超装: {rf_used} > {entry['rf_headroom']}"
-            assert hc_used <= entry["hc_headroom"], f"[{label}] host={hk} hc超装: {hc_used} > {entry['hc_headroom']}"
+    # 绕圈场景：host_key POL_h=8,POD_h=2（跨圈，从8号港绕回2号港才discharge），
+    # n_ports=10。以POL_h=8为锚点，rank(2)=(2-8+10)=4。尾箱POL_t=9,POD_t=1：
+    # rank(1)=(1-8+10)=3<=4 -> 应通过（尾箱在绕圈途中比host先卸货）。
+    label = "deck host绕圈场景-rank()正确处理wraparound-应通过"
+    host_key = (0, 0, 1, 8, 2)
+    actual = _host_compatible(host_key, None, 9, 1, pm, np_)
+    ok = actual is True
+    all_ok = all_ok and ok
+    print(f"  [{'OK' if ok else 'MISMATCH'}] {label}: host={host_key}, tail=[9,1) -> {actual} (预期True)")
 
-        print(f"[OK] {label} 对账通过，且未发现超装")
-        return placements, unplaced
-
-    # 1. 完美匹配
-    _check(
-        "1-完美匹配",
-        [{"POL": 0, "POD": 1, "type": "GP", "count": 3, "source": 1}],
-        {(0, 0, 0, 0, 1): {"gp_headroom": 3, "rf_headroom": 0, "hc_headroom": 0,
-                            "hd": 0, "capacity_total": 3, "capacity_rf": 0, "capacity_hc": 0}},
-    )
-
-    # 2. headroom不够，多条尾箱记录分摊同一个host，最后一条部分进unplaced
-    _check(
-        "2-分摊同一host_部分unplaced",
-        [
-            {"POL": 0, "POD": 2, "type": "GP", "count": 3, "source": 1},
-            {"POL": 0, "POD": 2, "type": "GP", "count": 4, "source": 2},
-        ],
-        {(0, 0, 0, 0, 2): {"gp_headroom": 5, "rf_headroom": 0, "hc_headroom": 0,
-                            "hd": 0, "capacity_total": 5, "capacity_rf": 0, "capacity_hc": 0}},
-    )
-
-    # 3. host_POL在裸数值上晚于尾箱POL——在distance规则替换裸数值比较之前，
-    # 这种情形恒被拒绝、整条进unplaced；换成_dist()之后，是否匹配取决于
-    # port_min/n_ports（环线绕圈可能让数值更大的host.POL其实离POD更远、
-    # 依然合法）。这里port_min=0,n_ports=10：dist(host.POL=5,POD=2)=7，
-    # dist(tail.POL=0,POD=2)=2，7>=2，现在反而会匹配成功——这不是回归，
-    # 是"距离规则完全替代裸数值比较"这个设计变化的直接后果，旧的"晚于就拒绝"
-    # 结论不再普遍成立，只在不绕圈(或未绕圈到覆盖这对POL的程度)时才成立。
-    _check(
-        "3-host_POL数值晚于尾箱POL(distance规则下不再必然拒绝)",
-        [{"POL": 0, "POD": 2, "type": "GP", "count": 4, "source": 1}],
-        {(0, 0, 0, 5, 2): {"gp_headroom": 10, "rf_headroom": 0, "hc_headroom": 0,
-                            "hd": 0, "capacity_total": 10, "capacity_rf": 0, "capacity_hc": 0}},
-    )
-
-    # 4. RF类型尾箱只匹配rf_headroom>0的host，不能被GP-only host吃掉
-    _check(
-        "4-RF只匹配rf_headroom_host",
-        [{"POL": 0, "POD": 3, "type": "RF", "count": 2, "source": 1}],
-        {
-            (0, 0, 0, 0, 3): {"gp_headroom": 5, "rf_headroom": 0, "hc_headroom": 0,
-                              "hd": 0, "capacity_total": 5, "capacity_rf": 0, "capacity_hc": 0},
-            (1, 0, 0, 0, 3): {"gp_headroom": 2, "rf_headroom": 2, "hc_headroom": 0,
-                              "hd": 0, "capacity_total": 2, "capacity_rf": 2, "capacity_hc": 0},
-        },
-    )
-
-    # 5. HC类型：gp_headroom=0但hc_headroom>0的host应被跳过（物理槽位满了）
-    _check(
-        "5-HC跳过物理槽位已满的host",
-        [{"POL": 0, "POD": 4, "type": "HC", "count": 2, "source": 1}],
-        {
-            (0, 0, 0, 0, 4): {"gp_headroom": 0, "rf_headroom": 0, "hc_headroom": 3,
-                              "hd": 1, "capacity_total": 3, "capacity_rf": 0, "capacity_hc": 3},
-            (1, 0, 0, 0, 4): {"gp_headroom": 2, "rf_headroom": 0, "hc_headroom": 2,
-                              "hd": 1, "capacity_total": 2, "capacity_rf": 0, "capacity_hc": 2},
-        },
-    )
-
-    # 6. 手算例子：tail POL=2 -> POD=5 (port_min=0, n_ports=7)。
-    # dist(tail.POL=2, POD=5) = 5-2 = 3。候选host的POL分别是6,1,2,3,4，
-    # 每个host只给headroom=1（跟count错开，方便按"有没有出现在placements"
-    # 直接判定这个host有没有被匹配到，不需要另外核对余量）：
-    #   dist(6,5)=5-6+7=6 >=3 -> 应匹配
-    #   dist(1,5)=5-1=4   >=3 -> 应匹配
-    #   dist(2,5)=5-2=3   >=3 -> 应匹配（等于也算，边界情形）
-    #   dist(3,5)=5-3=2   <3  -> 应拒绝
-    #   dist(4,5)=5-4=1   <3  -> 应拒绝
-    print("\n---- 手算场景6: tail POL=2 -> POD=5 (port_min=0, n_ports=7) ----")
-    tail_list_6 = [{"POL": 2, "POD": 5, "type": "GP", "count": 10, "source": 1}]
-    host_pool_6 = {
-        (0, 0, 0, host_pol, 5): {"gp_headroom": 1, "rf_headroom": 0, "hc_headroom": 0,
-                                  "hd": 0, "capacity_total": 1, "capacity_rf": 0, "capacity_hc": 0}
-        for host_pol in (6, 1, 2, 3, 4)
-    }
-    placements_6, unplaced_6 = _check(
-        "6-手算distance例子(2→5)", tail_list_6, host_pool_6, port_min=0, n_ports=7)
-    matched_pols_6 = {p["host_POL"] for p in placements_6}
-    expected_matched_6 = {6, 1, 2}
-    print(f"实际匹配到的host.POL集合={matched_pols_6}, 手算预期={expected_matched_6}")
-    assert matched_pols_6 == expected_matched_6, \
-        f"[手算场景6] 匹配到的host.POL集合跟手算不一致: {matched_pols_6} != {expected_matched_6}"
-    print("[OK] 手算场景6：匹配结果与手算完全一致")
-
-    # 7. 手算例子：tail POL=5 -> POD=2 (port_min=0, n_ports=7)。
-    # dist(tail.POL=5, POD=2) = 2-5+7 = 4。候选host的POL分别是3,4,5,6,0,1：
-    #   dist(3,2)=2-3+7=6 >=4 -> 应匹配
-    #   dist(4,2)=2-4+7=5 >=4 -> 应匹配
-    #   dist(5,2)=2-5+7=4 >=4 -> 应匹配（边界相等）
-    #   dist(6,2)=2-6+7=3 <4  -> 应拒绝
-    #   dist(0,2)=2-0=2   <4  -> 应拒绝
-    #   dist(1,2)=2-1=1   <4  -> 应拒绝
-    print("\n---- 手算场景7: tail POL=5 -> POD=2 (port_min=0, n_ports=7) ----")
-    tail_list_7 = [{"POL": 5, "POD": 2, "type": "GP", "count": 10, "source": 1}]
-    host_pool_7 = {
-        (0, 0, 0, host_pol, 2): {"gp_headroom": 1, "rf_headroom": 0, "hc_headroom": 0,
-                                  "hd": 0, "capacity_total": 1, "capacity_rf": 0, "capacity_hc": 0}
-        for host_pol in (3, 4, 5, 6, 0, 1)
-    }
-    placements_7, unplaced_7 = _check(
-        "7-手算distance例子(5→2)", tail_list_7, host_pool_7, port_min=0, n_ports=7)
-    matched_pols_7 = {p["host_POL"] for p in placements_7}
-    expected_matched_7 = {3, 4, 5}
-    print(f"实际匹配到的host.POL集合={matched_pols_7}, 手算预期={expected_matched_7}")
-    assert matched_pols_7 == expected_matched_7, \
-        f"[手算场景7] 匹配到的host.POL集合跟手算不一致: {matched_pols_7} != {expected_matched_7}"
-    print("[OK] 手算场景7：匹配结果与手算完全一致")
-
-    print("\n[OK] 全部7个场景验证通过")
+    print(f"\n[{'OK' if all_ok else 'MISMATCH'}] _host_compatible 全部用例{'通过' if all_ok else '未全部通过'}")
 
 
-def _tail_resource_kind(ctype: str) -> str:
-    """GP/HC占用同一种物理槽位资源(gp_headroom口径)，RF/HR占用另一种
-    (rf_headroom口径，限can_reefer槽位)。"""
-    if ctype in ("GP", "HC"):
-        return "GP"
-    if ctype in ("RF", "HR"):
-        return "RF"
-    raise ValueError(f"未知尾箱类型: {ctype}")
-
-
-def _host_slot_mask(df: pd.DataFrame, bay_idx: int, lr: int, hd: int, resource: str) -> pd.Series:
-    """host cell在b0侧对应的槽位行mask，resource='RF'时只认can_reefer槽位
-    （RF/HR类型只能占用具备reefer能力的物理槽位）。"""
-    mask = (df["bay_idx"] == bay_idx) & (df["lr"] == lr) & (df["hd"] == hd) & df["can_40ft"]
-    if resource == "RF":
-        mask = mask & df["can_reefer"]
-    return mask
-
-
-def _select_empty_host_slots(df: pd.DataFrame, bay_idx: int, lr: int, hd: int, resource: str) -> list:
-    """在host cell里，按proj_cell_to_vessel同款槽位选择顺序（tier_idx升序、
-    从中间到两边的row_idx顺序），挑出当前POD==-1的空槽位index，供尾箱摊入。
-    不重新发明摆放顺序，直接复刻proj_cell_to_vessel里那段排序逻辑。"""
-    mask = _host_slot_mask(df, bay_idx, lr, hd, resource)
-    idx_list = list(df.index[mask])
-    row_reverse = (lr == 0)
-    idx_list.sort(key=lambda idx: (
-        df.at[idx, "tier_idx"],
-        -df.at[idx, "row_idx"] if row_reverse else df.at[idx, "row_idx"],
-    ))
-    return [idx for idx in idx_list if df.at[idx, "POD"] == -1]
-
-
-def _inject_tail_into_snapshot(df: pd.DataFrame, big_bay: int, lr: int, hd: int,
-                                tail_pol: int, pod: int, ctype: str, count: int, host_key) -> None:
-    """把这条尾箱记录摊进df（version2的某一张POL快照）里，占用host cell当前
-    空着的槽位，b0/b1两侧同步写回，跟proj_cell_to_vessel的镜像写回口径一致。
-
-    写回的POL标记用尾箱记录自己的POL（tail_pol，这批箱子实际的登船港），
-    不是host的POL——host只是"借用"的那个物理cell，尾箱本身是另一趟单独的
-    booking，物理上是从tail_pol这一港才装船的，标记成host_POL会让这批箱子
-    看起来在host诞生的那一港就已经在船上，跟事实不符。
-
-    只在这里做"物理槽位是否真的够"的最后一道防线校验——真正的静态headroom
-    对账在apply_tail_placements里injection之前就做过一次，这里如果还是不够，
-    说明状态在两次检查之间被意外改变了，直接报错而不是摊出界。
+def _row_slot_state(df: pd.DataFrame, b0: int, lr: int, hd: int, row_idx: int):
+    """从slot级DataFrame（某一POL快照的proj_cell_to_vessel投影结果）里，把
+    host cell某一摞(row)的当前占用状态提炼成proj_to_slot需要的
+    (rf_idx, n_eff, available_idx, idx_list)——proj_to_slot要求的"任意起点续摆"
+    正是这里现算出来的：available_idx只含POD==-1(真正物理空着)的can_40ft槽位，
+    n_eff=这一摞can_40ft槽位数-已摊RF的槽位数，跟proj_cell_to_vessel第二步
+    喂给proj_to_slot的口径一致，只是那边起点固定是"空cell"，这里起点是
+    snapshot当前的实际占用状态（可能已经被更早的尾箱记录占掉一部分）。
+    idx_list是这一摞全部物理槽位（含已占用/RF），供proj_to_slot Pass B现场
+    判断这摞是否已经沾过is_hc（dry HC或HR），跟proj_cell_to_vessel第二步的
+    口径一致。
     """
-    b0, b1 = STSE_BAY_PAIRS[big_bay]
-    resource = _tail_resource_kind(ctype)
-    empty_idx = _select_empty_host_slots(df, b0, lr, hd, resource)
-    if len(empty_idx) < count:
-        raise AssertionError(
-            f"[apply_tail_placements] host={host_key} 实际空槽位({len(empty_idx)}, "
-            f"资源类型={resource})不足以安置{count}个{ctype}尾箱——注入过程中状态被意外改变了"
-        )
-    target_idx = empty_idx[:count]
-    for idx in target_idx:
-        row_idx = df.at[idx, "row_idx"]
-        tier_idx = df.at[idx, "tier_idx"]
-
-        df.at[idx, "POL"] = tail_pol
-        df.at[idx, "POD"] = pod
-        if resource == "GP":
-            df.at[idx, "GP_count"] = 1
-        else:
-            df.at[idx, "RF_count"] = 1
-        if ctype in ("HC", "HR"):
-            df.at[idx, "is_hc"] = True
-
-        b1_mask = (df["bay_idx"] == b1) & (df["row_idx"] == row_idx) & (df["tier_idx"] == tier_idx)
-        for b1_idx in df.index[b1_mask]:
-            df.at[b1_idx, "POL"] = tail_pol
-            df.at[b1_idx, "POD"] = pod
-            if resource == "GP":
-                df.at[b1_idx, "GP_count"] = 1
-            else:
-                df.at[b1_idx, "RF_count"] = 1
-            if ctype in ("HC", "HR"):
-                df.at[b1_idx, "is_hc"] = True
+    mask = (
+        (df["bay_idx"] == b0) & (df["lr"] == lr) & (df["hd"] == hd)
+        & (df["row_idx"] == row_idx) & df["can_40ft"]
+    )
+    idx_list = sorted(df.index[mask], key=lambda i: df.at[i, "tier_idx"])
+    rf_idx = [i for i in idx_list if df.at[i, "RF_count"] == 1]
+    rf_set = set(rf_idx)
+    n_eff = len(idx_list) - len(rf_idx)
+    available_idx = [i for i in idx_list if df.at[i, "POD"] == -1 and i not in rf_set]
+    return rf_idx, n_eff, available_idx, idx_list
 
 
-def apply_tail_placements(vessel: Vessel, snapshots: dict, original_cbf: dict, placements: list):
+def retrofit_tail_placements(vessel: Vessel, snapshots: dict, tail_list: list, original_cbf: dict) -> dict:
     """
-    任务3：把match_tails_to_hosts产出的placements二次投影进slot级DataFrame，
-    产出版本1（原始投影，未受尾箱影响）和版本2（叠加尾箱后的投影），供人工/
-    自动核对尾箱摆放是否合理、跨港是否一致。
+    一段式尾箱安置：边扫描host候选（scan_host_candidates给的静态row几何）边
+    用vessel.proj_to_slot现场分配，不做独立记账——分配是否成功、缺口是否
+    变小，全部交给调用方重新跑一遍build_tail_container_list(..., proj_override=
+    返回值)对比。
 
-    不改vessel.cell/vessel.cbf/snapshots本身：版本1/版本2都是各POL快照
-    proj_cell_to_vessel输出的DataFrame的独立副本。
+    只处理GP/HC两种类型。RF/HR跳过：proj_to_slot目前只支持HC/GP两遍法从
+    任意起点续摆，RF摊放逻辑（proj_cell_to_vessel第一步）还没有对应的
+    "接着摆"版本，勉强复用会摆错reefer槽位，这次不做。
+    TODO: RF/HR retrofit需要先给RF摊放逻辑补一个"从当前占用状态续摆"的版本，
+    再复用这里同一套host兼容性判断+row遍历框架。
 
-    对每条placement记录，存活区间是[effective_start, effective_end)——不是
-    单纯的[tail.POL, POD)裸数值区间。区间起点effective_start=
-    max(host.POL, tail.POL)（原则上恒等于tail.POL，因为match_tails_to_hosts
-    已经保证host.POL<=tail.POL，这里仍显式取max是为了不偷偷依赖那个前提）：
-    host.POL只是这个物理cell本身第一次被装货的港口，跟这条尾箱记录自己的
-    POL(它真正登船的港口)是两回事，尾箱在自己的POL之前根本没上船，不能出现
-    在更早港口的departure快照里——覆盖的POL快照范围必须以尾箱自己的POL为起点。
+    每条尾箱记录[POL_t,POD_t)：
+        1. 按host_key自然顺序遍历scan_host_candidates()给的host候选池
+           （TODO：遍历顺序目前是占位实现，后续可能需要按距离/剩余容量
+           等指标排序优化，而不是host_key的字典序）。
+        2. 用_host_compatible()判断这个host是否合法可用（不再用一个提前
+           算好的headroom数字，而是先看host是否"站得住脚"）。
+        3. 合法的host按row_idx升序遍历它的每一摞：一个row一旦被某个POD
+           占用过（不管是host自己原来的货，还是本次retrofit某条尾箱记录
+           占用的），后续别的POD不能再用同一row（claimed_rows全局跟踪）；
+           物理空间是否还有剩余，现场用_row_slot_state从tail自己POL_t那张
+           快照的slot级投影里读——host/deck cell的占用状态从各自的POL到
+           各自的POD之间是静态不变的（不discharge就不会变），只要
+           _host_compatible已经保证了尾箱落在host/deck都还"活着"的区间内，
+           在POL_t这一张快照上查到的占用状态就代表了整个重叠区间的真实
+           状态，不需要逐张快照重复查。
+        4. 用vessel.proj_to_slot在这一row上续摆，能放多少放多少，
+           对应尾箱记录的count相应减少，直到count归零或候选row用尽，
+           转下一条尾箱记录。
 
-    区间终点effective_end是"绕圈感知"的：这条船的POL推进在真实航次里严格
-    从port_min升到port_max、从不回绕（Vessel.advance_pol()只是
-    current_pol+=1），但POD是"相对某个POL的将来某一港"，可能因为航线本身是
-    环线，数值上比它自己的POL还小（例如host.POL=3却POD=2）——这种情况下这批
-    货真正被discharge的那一港落在本次建模航次范围之外（超过port_max才会
-    真正卸货，根本不会出现在snapshots里），如果还照字面数值算[POL,POD)，
-    会因为POD数值<=起点而得到一个空区间，导致注入被静默跳过，但headroom
-    计数器仍会正常累加——这正是真实数据里62.5%尾箱记录(POL>=POD)会触发
-    headroom前置校验误报AssertionError的根因。修正为：
-        effective_end = POD if POD > effective_start else (vessel.port_max + 1)
-    即POD数值大于起点时按原样处理（正常区间，未绕圈）；POD<=起点时视为
-    "绕圈，这一港在本次建模航次里追不上"，改为一直存活到最后一张快照
-    （vessel.port_max，区间右开，所以传port_max+1）。
+    写回目标：尾箱从POL_t（不含）到POD_t（不含，若POD_t数值<=POL_t即绕圈货，
+    真正卸货港落在本次建模航次范围之外，则clamp到port_max）之间，严格更晚的
+    每一张departure快照都要写——跟host正常货物在self.cell里"跨港持续存在直到
+    discharge"是同一个语义，只是尾箱这边没有self.cell兜底，这里手动实现同样的
+    "持续在船"判断。snapshots的key是单趟航次里严格递增的真实时间顺序
+    （Vessel.advance_pol()只会+1，不会绕圈），所以这里只能用不绕圈、clamp到
+    port_max的线性区间判断，不能用_dist()/rel_rank那套环线感知距离——那是为
+    "两个POD谁该先卸货"这类路由序比较设计的，用在这里会把POD_t数值小于POL_t
+    的绕圈尾箱反向传播到比POL_t更早的快照上（这批货那时候根本还没装船），
+    产生悬空箱这种物理不可能状态。
+    对slot_dict里出现过的每个候选POL p，只要满足
+        POL_t < p < effective_end   （effective_end = POD_t if POD_t > POL_t else port_max+1）
+    这批尾箱在POL_t那张快照上实际占用的物理slot（含b1镜像）就原样复制到
+    slot_dict[p]的同一批slot上。之所以能直接按slot index复制，是因为
+    full_slot_table是静态几何、每次proj_cell_to_vessel都从它deepcopy出发，
+    同一物理slot在所有POL的DataFrame里index恒定一致。
+    复制前检查目标slot是否已被占用（POD!=-1）：host兼容性判断已经保证尾箱
+    只会用到host没占用的物理空间，正常情况下目标slot要么空、要么是这批尾箱
+    自己之前传播过去的同一记录（幂等，直接跳过）；如果发现被别的POD占用，
+    这是物理冲突，单独打印报出来，不静默覆盖。
 
-    在这个区间覆盖的每一张POL快照上，把这条尾箱摊进host对应的物理槽位
-    （摊入顺序复用_select_empty_host_slots，就是proj_cell_to_vessel本身的
-    槽位选择顺序，不重新发明）。
+    build_tail_container_list按(POL,POD)算缺口时，只看POL==这批箱子自己的
+    登船港那一张departure快照，所以上面的跨港传播不影响缺口核算口径，只影响
+    下游export_bayplan_from_slots这类直接消费slot_dict渲染每一港after图的
+    调用方。
 
-    注入前的静态headroom前置校验：用scan_host_candidates重新算一遍host候选池
-    （2c阶段host_pool的headroom就是这么算出来的，这里没有单独的口径），
-    在每个host第一次被注入前，比对它在尾箱自己POL那张快照里的实际物理空槽位数
-    跟host_pool记录的headroom是否一致（累减掉本次调用里已经安置过的量）。
-    对不上就说明状态在2b算完之后被什么东西改变了，直接AssertionError，
-    不静默注入导致箱子摆进本来有货的slot。
-
-    同一个host被多条placement共享时，按各自的tail.POL升序处理——因为
-    Interval(tail.POL)=[effective_start,effective_end)在同一个host(同一个POD)
-    下随tail.POL增大而单调收缩（不管POD是否绕圈：未绕圈时effective_end=POD
-    固定，起点变大区间变小；绕圈时effective_end=port_max+1固定，同理），
-    升序处理能保证轮到某条记录做headroom前置校验时，所有tail.POL更早（区间
-    更大、必然覆盖当前这张检查快照）的记录都已经真实注入过了，检查用的
-    "实际空槽位数"才跟累计扣减的"预期剩余"对得上，不会因为乱序而误报。
-
-    返回(version1_dict, version2_dict)，key都是POL，value是slot级DataFrame。
+    返回dict{POL: slot级DataFrame}，覆盖snapshots里出现过的所有POL，供
+    build_tail_container_list(..., proj_override=返回值)直接复用重新核算
+    缺口，也可以整体当成"叠加尾箱后的departure快照"传给export_bayplan等
+    下游消费者。
     """
     host_pool = scan_host_candidates(vessel, snapshots)
 
-    version1_dict = {}
-    version2_dict = {}
-    for pol in sorted(snapshots.keys()):
-        df = vessel.proj_cell_to_vessel(cell_state=snapshots[pol], original_cbf=original_cbf)
-        version1_dict[pol] = df
-        version2_dict[pol] = df.copy(deep=True)
+    slot_dict = {
+        pol: vessel.proj_cell_to_vessel(cell_state=snapshots[pol], original_cbf=original_cbf)
+        for pol in snapshots
+    }
 
-    consumed_by_host = {}  # host_key -> {"GP": 已安置量, "RF": 已安置量}
+    deck_info_cache = {}
 
-    for placement in sorted(placements, key=lambda p: p["POL"]):
-        host_key = (placement["host_bay"], placement["host_lr"], placement["host_hd"],
-                    placement["host_POL"], placement["POD"])
-        host_entry = host_pool.get(host_key)
-        if host_entry is None:
-            raise AssertionError(
-                f"[apply_tail_placements] placement引用的host={host_key} 不在"
-                f"scan_host_candidates重算出的host候选池里，2b/2c之间的状态已经不一致了"
-            )
+    def _deck_info(bay, lr):
+        key = (bay, lr)
+        if key not in deck_info_cache:
+            info = None
+            for pol in sorted(snapshots.keys()):
+                rec = snapshots[pol]["cell"][bay, lr, 1]
+                if rec["POD"] != -1:
+                    info = (rec["POL"], rec["POD"])
+                    break
+            deck_info_cache[key] = info
+        return deck_info_cache[key]
 
-        ctype = placement["type"]
-        count = placement["count"]
-        tail_pol = placement["POL"]
-        pod = placement["POD"]
-        resource = _tail_resource_kind(ctype)
+    claimed_rows = {}  # (host_key, row_idx) -> 占用它的POD，同一row只能给一个POD用
 
-        used = consumed_by_host.setdefault(host_key, {"GP": 0, "RF": 0})
+    for tail in tail_list:
+        ctype = tail["type"]
+        if ctype not in ("GP", "HC"):
+            continue  # TODO: RF/HR retrofit暂不支持，见函数docstring
 
-        # 绕圈感知的存活区间：起点恒等于tail_pol（match_tails_to_hosts已保证
-        # host.POL<=tail.POL，这里显式取max不偷偷依赖那个前提）；终点在
-        # POD>起点时按原样处理，POD<=起点（绕圈，这一港在本次建模航次里追不
-        # 上）时改为一直存活到最后一张快照(vessel.port_max)。
-        effective_start = max(placement["host_POL"], tail_pol)
-        effective_end = pod if pod > effective_start else (vessel.port_max + 1)
+        pol_t, pod_t = tail["POL"], tail["POD"]
+        remaining = tail["count"]
+        if remaining <= 0 or pol_t not in slot_dict:
+            continue
 
-        # 前置校验：用effective_start那张快照(必然在snapshots范围内)上的
-        # 实际空槽位数，比对host_pool记录的静态headroom(扣掉这次调用里已经
-        # 安置过的量)是否吻合。
-        check_df = version2_dict[effective_start]
-        b0 = STSE_BAY_PAIRS[placement["host_bay"]][0]
-        actual_empty = len(_select_empty_host_slots(
-            check_df, b0, placement["host_lr"], placement["host_hd"], resource))
-        static_headroom = host_entry["rf_headroom"] if resource == "RF" else host_entry["gp_headroom"]
-        expected_remaining = static_headroom - used[resource]
-        if actual_empty != expected_remaining:
-            raise AssertionError(
-                f"[apply_tail_placements] host={host_key} 资源类型={resource} 的实际空槽位"
-                f"({actual_empty})跟host_pool记录的headroom推算值({expected_remaining}, "
-                f"静态headroom={static_headroom}，本次调用已安置={used[resource]})对不上，"
-                f"说明2b算完之后状态被意外改变了，拒绝静默注入"
-            )
+        df = slot_dict[pol_t]
 
-        affected_pols = [p for p in sorted(snapshots.keys()) if effective_start <= p < effective_end]
-        for pol in affected_pols:
-            _inject_tail_into_snapshot(
-                version2_dict[pol], placement["host_bay"], placement["host_lr"], placement["host_hd"],
-                tail_pol, pod, ctype, count, host_key,
-            )
+        # "这批尾箱此刻仍在船上"的目标POL集合：snapshots的key是单趟航次里严格
+        # 递增的真实时间顺序（advance_pol()只会+1，不会绕圈），不能用_dist()那套
+        # 环线感知距离来判断——那是为get_candidates/_host_compatible这类"两个
+        # POD谁该先卸货"的路由序比较设计的，把它套用在这里会让POD_t数值上小于
+        # POL_t的尾箱（绕圈货，比如POL=6装POD=1）反向"传播"到比POL_t更早的
+        # 快照上（比如传播回POL=0那张出港前的快照），出现物理上不可能的悬空箱——
+        # 这批货在POL=0出港时根本还没装船。
+        # 正确语义：只往严格更晚的快照传播，直到POD_t（不含）——POD_t数值上
+        # 小于等于POL_t时（绕圈货，真正的卸货港在本次建模航次范围之外），
+        # 传播终点clamp到port_max+1（航次内剩下的所有快照都算"仍在船上"），
+        # 不再绕回小编号的POL。
+        effective_end = pod_t if pod_t > pol_t else (vessel.port_max + 1)
+        carry_pols = [p for p in slot_dict if pol_t < p < effective_end]
 
-        used[resource] += count
+        # TODO: host/row遍历顺序目前是host_key自然排序的占位实现，见docstring。
+        for host_key in sorted(host_pool.keys()):
+            if remaining <= 0:
+                break
+            bay, lr, hd, pol_h, pod_h = host_key
+            deck_info = _deck_info(bay, lr) if hd == 0 else None
+            if not _host_compatible(host_key, deck_info, pol_t, pod_t, vessel.port_min, vessel.n_ports):
+                continue
 
-    return version1_dict, version2_dict
+            b0, b1 = STSE_BAY_PAIRS[bay]
+            for row_idx in host_pool[host_key]["rows"]:
+                if remaining <= 0:
+                    break
+                row_key = (host_key, row_idx)
+                claimed_pod = claimed_rows.get(row_key)
+                if claimed_pod is not None and claimed_pod != pod_t:
+                    continue
 
+                rf_idx, n_eff, available_idx, idx_list = _row_slot_state(df, b0, lr, hd, row_idx)
+                if not available_idx:
+                    continue
 
-def verify_cross_port_consistency(version2_dict: dict, placements: list, port_max: int) -> bool:
-    """
-    跨港一致性回归检查（黑盒，不依赖apply_tail_placements内部实现）：
-    对placements每条记录，确认其host坐标(big_bay, lr, hd)：
-    - 在[effective_start, effective_end)覆盖的每一张POL快照的version2
-      DataFrame里，都能查到>=count条(bay_idx==b0, lr, hd, POL==tail.POL,
-      POD==POD)的匹配记录；
-    - 在这个区间之外的POL快照里，这个host坐标不应该出现任何
-      (POL==tail.POL, POD==POD)的匹配记录（防止箱子凭空出现/消失）。
+                row = {
+                    "hd": hd, "bay_idx": bay, "row_idx": row_idx, "lr": lr,
+                    "rf_idx": rf_idx, "n_eff": n_eff, "available_idx": available_idx,
+                    "idx_list": idx_list,
+                }
+                hc_budget = remaining if ctype == "HC" else 0
+                gp_budget = remaining if ctype == "GP" else 0
+                hc_left, gp_left = vessel.proj_to_slot(df, [row], pol_t, pod_t, hc_budget, gp_budget)
+                placed = (hc_budget - hc_left) if ctype == "HC" else (gp_budget - gp_left)
+                if placed <= 0:
+                    continue
 
-    区间起点用max(host.POL, tail记录自己的POL)：这批箱子在自己的POL之前
-    根本没上船，不能出现在更早港口的departure快照里；host.POL只是host这个
-    物理cell自己诞生的港口，跟尾箱是两个独立的量，不能替代——两者取max只是
-    不偷偷依赖"host.POL<=tail.POL"这个由match_tails_to_hosts保证的前提。
+                claimed_rows[row_key] = pod_t
+                remaining -= placed
 
-    区间终点是"绕圈感知"的，跟apply_tail_placements用的是同一个判据（但
-    port_max由调用方显式传入，不读取vessel/host内部状态，仍然是黑盒重新
-    推导，不共享apply_tail_placements内部计算出的effective_end）：这条船的
-    POL推进严格从port_min升到port_max、从不回绕，但POD代表"相对某个POL的
-    将来某一港"，可能因为航线本身是环线而数值上比起点还小——这种情况下
-    真正的discharge发生在本次建模航次范围之外，判定为一直存活到最后一张
-    快照(port_max)。POD>起点时按原样处理（未绕圈，区间就是[起点,POD)）。
-    这里跟apply_tail_placements各自独立按同一份placements重新推导判据，
-    不共享内部状态，避免两边用同一个错误前提互相掩盖问题——如果只改了
-    apply_tail_placements而不同步这里，就会退回到"验证函数和被验证函数
-    共享同一个（错误）前提"的老问题，绕圈场景会被误判为一致。
+                # b1侧镜像，跟proj_cell_to_vessel第二步结束后的镜像逻辑一致。
+                touched_idx = list(row["hc_idx"]) + list(row["gp_idx"])
+                for idx in row["hc_idx"] + row["gp_idx"]:
+                    row_i = df.at[idx, "row_idx"]
+                    tier_i = df.at[idx, "tier_idx"]
+                    gp_val = int(df.at[idx, "GP_count"])
+                    rf_val = int(df.at[idx, "RF_count"])
+                    is_hc_val = bool(df.at[idx, "is_hc"])
+                    for mirror_idx in df.index[
+                        (df["bay_idx"] == b1) & (df["row_idx"] == row_i) & (df["tier_idx"] == tier_i)
+                    ]:
+                        df.at[mirror_idx, "POL"] = pol_t
+                        df.at[mirror_idx, "POD"] = pod_t
+                        df.at[mirror_idx, "GP_count"] = gp_val
+                        df.at[mirror_idx, "RF_count"] = rf_val
+                        df.at[mirror_idx, "is_hc"] = is_hc_val
+                        touched_idx.append(mirror_idx)
 
-    不一致的记录逐条打印细节（不只给pass/fail）。返回是否全部一致。
-    """
-    all_ok = True
-    for placement in placements:
-        big_bay = placement["host_bay"]
-        lr = placement["host_lr"]
-        hd = placement["host_hd"]
-        host_pol = placement["host_POL"]
-        tail_pol = placement["POL"]
-        pod = placement["POD"]
-        count = placement["count"]
-        b0 = STSE_BAY_PAIRS[big_bay][0]
+                # 跨港传播：这批尾箱在[POL_t,POD_t)期间跨越的每一张快照都要
+                # 出现同一批物理slot的占用，语义等价host货物在self.cell里
+                # "跨港持续存在直到discharge"。
+                for p in carry_pols:
+                    other = slot_dict[p]
+                    for idx in touched_idx:
+                        cur_pod = other.at[idx, "POD"]
+                        if cur_pod != -1 and not (
+                            cur_pod == pod_t and other.at[idx, "POL"] == pol_t
+                        ):
+                            print(f"[retrofit_tail_placements][冲突] slot idx={idx} 在POL={p}的投影里"
+                                  f"已被POL={other.at[idx, 'POL']}/POD={cur_pod}占用，"
+                                  f"跳过传播尾箱POL={pol_t}/POD={pod_t}的占用（不静默覆盖）")
+                            continue
+                        other.at[idx, "POL"] = pol_t
+                        other.at[idx, "POD"] = pod_t
+                        other.at[idx, "GP_count"] = df.at[idx, "GP_count"]
+                        other.at[idx, "RF_count"] = df.at[idx, "RF_count"]
+                        other.at[idx, "is_hc"] = df.at[idx, "is_hc"]
 
-        effective_start = max(host_pol, tail_pol)
-        effective_end = pod if pod > effective_start else (port_max + 1)
-
-        for pol in sorted(version2_dict.keys()):
-            df = version2_dict[pol]
-            mask = (
-                (df["bay_idx"] == b0) & (df["lr"] == lr) & (df["hd"] == hd)
-                & (df["POL"] == tail_pol) & (df["POD"] == pod)
-            )
-            matched = int(mask.sum())
-            in_interval = effective_start <= pol < effective_end
-
-            if in_interval and matched < count:
-                all_ok = False
-                print(f"[MISMATCH-区间内缺失] placement={placement}: POL快照={pol} 在存活区间"
-                      f"[{effective_start},{effective_end})内，只找到{matched}条匹配记录(预期>={count})")
-            if not in_interval and matched > 0:
-                all_ok = False
-                print(f"[MISMATCH-区间外出现] placement={placement}: POL快照={pol} 在存活区间"
-                      f"[{effective_start},{effective_end})之外，却出现了{matched}条匹配记录(预期0)")
-
-    if all_ok:
-        print("[OK] 跨港一致性回归检查通过：所有placements在存活区间内外都符合预期")
-    return all_ok
-
-
-def _slots_bay_totals(df: pd.DataFrame, n_bay: int, filter_col: str, filter_val: int) -> np.ndarray:
-    """按big_bay汇总slot级DataFrame里满足(filter_col==filter_val)的GP_count+
-    RF_count，只读b0侧行——跟Vessel.build_vessel_cell/capacity_hc的统计口径
-    一致，b1侧是镜像，不重复计数。
-
-    直接在slot级别按POL/POD过滤求和，不经过cell级(n_bay,2,2)单record重建：
-    Vessel.cell的"一个cell只认一个POL"是求解阶段的真实不变量（assign()整格
-    赋值），但apply_tail_placements之后的version2里，同一个host物理cell完全
-    可能同时装着host自己的原始货(host.POL)和不同POL的尾箱(tail.POL)——这是
-    尾箱安置故意引入的、模型里此前不会出现的情形，重建单POL的cell record
-    在这种场景下要么丢箱、要么断言失败，所以CI对比改成直接在slot粒度上按
-    POL/POD过滤求和，天然兼容一个物理cell里混着多个POL的情况。
-    """
-    totals = np.zeros(n_bay, dtype=int)
-    for big_bay in range(n_bay):
-        b0 = STSE_BAY_PAIRS[big_bay][0]
-        rows = df[(df["bay_idx"] == b0) & df["can_40ft"] & (df["POD"] != -1) & (df[filter_col] == filter_val)]
-        totals[big_bay] = int((rows["GP_count"] + rows["RF_count"]).sum())
-    return totals
-
-
-def _ci_from_slot_version_dict(version_dict: dict, n_bay: int) -> list:
-    """跟utils.evaluate._port_bay_totals+evaluate_crane_intensity同一套定义
-    （discharge_tally=上一张快照里POD==本港的箱量，loading_tally=本快照里
-    POL==本港的箱量，CI=总量/最挤相邻bay对之和），只是直接在slot级
-    DataFrame上算，不经过cell级单POL假设（见_slots_bay_totals）。
-
-    返回list[dict]，跟evaluate_crane_intensity()的返回格式对齐：
-    {"pol","bay_total","ci"}，供跟真正的evaluate_crane_intensity结果对比打印。
-    """
-    from utils.evaluate import _ci_from_bay_totals
-
-    results = []
-    prev_df = None
-    for pol in sorted(version_dict.keys()):
-        df = version_dict[pol]
-        if prev_df is not None:
-            discharge_tally = _slots_bay_totals(prev_df, n_bay, "POD", pol)
-        else:
-            discharge_tally = np.zeros(n_bay, dtype=int)
-        loading_tally = _slots_bay_totals(df, n_bay, "POL", pol)
-        bay_total = discharge_tally + loading_tally
-        results.append({"pol": pol, "bay_total": bay_total, "ci": _ci_from_bay_totals(bay_total)})
-        prev_df = df
-    return results
+    return slot_dict
 
 
 def build_tail_placement_demo_scenario():
@@ -1084,113 +750,74 @@ def build_tail_placement_demo_scenario():
     return vessel
 
 
-def verify_apply_tail_placements():
+def verify_retrofit_tail_placements():
     """
-    验证apply_tail_placements + verify_cross_port_consistency：
-    1. 优先复用build_test_scenario()跑出的tail_list/host_pool/placements，
-       实测匹配数是0（host的headroom被榨干成0），改用专门构造的
-       build_tail_placement_demo_scenario()兜底，保证至少有1条placement、
-       且host跨越discharge边界（存活区间跨2张POL快照）。
-    2. 对版本1/版本2各跑一遍evaluate_crane_intensity(如果utils/evaluate.py里有)，
-       打印两者CI数值对比，只做观察不做断言。
-    3. 手动打印几个受影响host的version1 vs version2槽位记录，供人工核对。
+    端到端验证retrofit_tail_placements：
+    1. build_tail_placement_demo_scenario()（seed固定为0，见其docstring里
+       记录的实测行为）保证产出至少1条真实缺口：POL=1,POD=2,GP=2，同时host
+       (big_bay=0,POL=0,POD=2)还剩2个物理空位——retrofit理论上应该能把这2个
+       缺口全部吃掉。
+    2. 跑retrofit_tail_placements()，重新调用build_tail_container_list(...,
+       proj_override=retrofit结果)算一遍新缺口，跟retrofit前的缺口对比，
+       确认(POL=1,POD=2,GP)这条缺口从2变成0（物理空间刚好够，能验证"缺口
+       变少"这个强断言，不只是"不变差"）。
+    3. 额外核对：retrofit前后，除了被吃掉的这条缺口，其它(POL,POD,type)
+       记录应保持不变（retrofit不应该动到跟这次尾箱无关的host）。
     """
     print("\n" + "=" * 60)
-    print("──── apply_tail_placements + 跨港一致性回归检查 验证 ────")
+    print("──── retrofit_tail_placements 端到端验证 ────")
     print("=" * 60)
 
-    def _build_placements_for(vessel_builder, label, seed=None):
-        if seed is not None:
-            random.seed(seed)
-        vessel = vessel_builder()
-        original_cbf = copy.deepcopy(vessel.cbf)
-        snapshots = {}
-        best = {"assigned": -1, "vessel": None}
-        success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
-        result_vessel = vessel if success else best["vessel"]
+    random.seed(0)
+    vessel = build_tail_placement_demo_scenario()
+    original_cbf = copy.deepcopy(vessel.cbf)
+    snapshots = {}
+    best = {"assigned": -1, "vessel": None}
+    success = solve(vessel, is_debug=False, snapshots=snapshots, best=best)
+    result_vessel = vessel if success else best["vessel"]
+    print(f"solve()完成: success={success}, snapshots覆盖POL={sorted(snapshots.keys())}")
 
-        tail_list = build_tail_container_list(result_vessel, snapshots, original_cbf)
-        host_pool = scan_host_candidates(result_vessel, snapshots)
-        placements, unplaced = match_tails_to_hosts(
-            tail_list, host_pool, result_vessel.port_min, result_vessel.n_ports)
-        print(f"\n---- 场景: {label} ----")
-        print(f"solve()完成: success={success}, snapshots覆盖POL={sorted(snapshots.keys())}")
-        print(f"tail_list={tail_list}")
-        print(f"host_pool={host_pool}")
-        print(f"placements({len(placements)}条)={placements}")
-        print(f"unplaced={unplaced}")
-        return result_vessel, snapshots, original_cbf, placements
+    tail_list_before = build_tail_container_list(result_vessel, snapshots, original_cbf)
+    print(f"retrofit前缺口: {tail_list_before}")
 
-    result_vessel, snapshots, original_cbf, placements = _build_placements_for(
-        lambda: build_test_scenario()[0], "build_test_scenario")
-
-    if not placements:
-        print("\nbuild_test_scenario()匹配数为0，改用专门构造的"
-              "build_tail_placement_demo_scenario()（seed固定为0，见其docstring里"
-              "记录的实测行为），保证至少产出1条跨discharge边界的placement")
-        result_vessel, snapshots, original_cbf, placements = _build_placements_for(
-            build_tail_placement_demo_scenario, "build_tail_placement_demo_scenario", seed=0)
-
-    if not placements:
-        print("[MISMATCH] 两个场景placements都是0条，无法验证apply_tail_placements，需要重新设计场景")
+    if not tail_list_before:
+        print("[跳过] 本次场景没有产出任何缺口，无法验证retrofit_tail_placements，"
+              "需要重新设计场景")
         return
 
-    # 至少验证一条host确实跨越了discharge边界(host_POL < POD，且中间横跨了
-    # >=1张POL快照的discharge动作，即[host_POL,POD)区间长度>=2)
-    cross_boundary = [p for p in placements if (p["POD"] - p["host_POL"]) >= 2]
-    print(f"\n跨discharge边界的placements(POD-host_POL>=2){'找到' if cross_boundary else '未找到'}: "
-          f"{cross_boundary if cross_boundary else '(本次场景里全部host都在单一港口内消化，未跨边界)'}")
+    retrofit_slots = retrofit_tail_placements(result_vessel, snapshots, tail_list_before, original_cbf)
+    print(f"retrofit_tail_placements完成，覆盖POL={sorted(retrofit_slots.keys())}")
 
-    version1_dict, version2_dict = apply_tail_placements(result_vessel, snapshots, original_cbf, placements)
-    print(f"\napply_tail_placements完成，version1覆盖POL={sorted(version1_dict.keys())}，"
-          f"version2覆盖POL={sorted(version2_dict.keys())}")
+    tail_list_after = build_tail_container_list(
+        result_vessel, snapshots, original_cbf, proj_override=retrofit_slots)
+    print(f"retrofit后缺口: {tail_list_after}")
 
-    ok = verify_cross_port_consistency(version2_dict, placements, result_vessel.port_max)
-    print(f"跨港一致性回归检查结果: {'PASS' if ok else 'FAIL'}")
+    before_map = {(r["POL"], r["POD"], r["type"]): r["count"] for r in tail_list_before}
+    after_map = {(r["POL"], r["POD"], r["type"]): r["count"] for r in tail_list_after}
 
-    # ── 2. CI版本1/版本2对比(观察，不断言)：直接在slot级上按同一套CI定义算，
-    # 不经过evaluate_crane_intensity要求的cell级单POL快照重建——host cell混装
-    # 多个POL的尾箱后，那套重建在这里已经不适用了(见_ci_from_slot_version_dict
-    # 的说明)，但CI公式本身仍然复用utils.evaluate._ci_from_bay_totals ──
-    try:
-        from utils.evaluate import _ci_from_bay_totals as _ci_probe  # noqa: F401
-        ci_available = True
-    except ImportError:
-        ci_available = False
+    total_before = sum(before_map.values())
+    total_after = sum(after_map.values())
+    print(f"总缺口: retrofit前={total_before}, retrofit后={total_after}")
 
-    if ci_available:
-        print("\n---- CI(crane intensity) 版本1 vs 版本2 对比(仅观察，不做断言) ----")
-        results_v1 = _ci_from_slot_version_dict(version1_dict, result_vessel.n_bay)
-        results_v2 = _ci_from_slot_version_dict(version2_dict, result_vessel.n_bay)
-        print(f"版本1(原始投影): {[(r['pol'], list(r['bay_total']), r['ci']) for r in results_v1]}")
-        print(f"版本2(叠加尾箱后): {[(r['pol'], list(r['bay_total']), r['ci']) for r in results_v2]}")
-        for r1, r2 in zip(results_v1, results_v2):
-            ci1, ci2 = r1["ci"], r2["ci"]
-            print(f"  POL={r1['pol']}: CI版本1={ci1}, CI版本2={ci2}, "
-                  f"差异={None if (ci1 is None or ci2 is None) else round(ci2 - ci1, 4)}")
+    shrunk = total_after < total_before
+    print(f"[{'OK' if shrunk else 'MISMATCH'}] 总缺口{'确实变少了' if shrunk else '没有变少(不符合预期)'}")
+
+    # 目标缺口(POL=1,POD=2,GP)应该被物理空位(2个)刚好吃满，变成0。
+    target_key = (1, 2, "GP")
+    target_before = before_map.get(target_key, 0)
+    target_after = after_map.get(target_key, 0)
+    print(f"目标缺口{target_key}: retrofit前={target_before}, retrofit后={target_after} (预期0)")
+    target_ok = target_before > 0 and target_after == 0
+    print(f"[{'OK' if target_ok else 'MISMATCH'}] 目标缺口{'被完全吃掉' if target_ok else '未按预期清零'}")
+
+    # 除目标缺口外，其它记录应保持不变——retrofit不该动到无关的host/尾箱。
+    other_keys = set(before_map) | set(after_map)
+    other_keys.discard(target_key)
+    unrelated_changed = [k for k in other_keys if before_map.get(k, 0) != after_map.get(k, 0)]
+    if unrelated_changed:
+        print(f"[MISMATCH] 以下无关缺口在retrofit前后发生了变化(不应该): {unrelated_changed}")
     else:
-        print("\nutils.evaluate里没有CI相关函数，跳过CI对比")
-
-    # ── 3. 手动打印受影响host的version1 vs version2槽位记录，供人工核对 ──
-    # 打印范围用host的完整存活区间[host.POL, POD)（不是注入区间[tail.POL,POD)），
-    # 这样才能对比出"host.POL到tail.POL之前应该保持原样为空、tail.POL开始才
-    # 出现尾箱"这个具体要求，而不是只看注入发生的那几张快照。
-    print("\n---- 受影响host的version1 vs version2槽位记录(人工核对) ----")
-    for placement in placements:
-        big_bay = placement["host_bay"]
-        lr, hd = placement["host_lr"], placement["host_hd"]
-        host_pol, tail_pol, pod = placement["host_POL"], placement["POL"], placement["POD"]
-        b0 = STSE_BAY_PAIRS[big_bay][0]
-        print(f"\nplacement={placement} (host存活区间=[{host_pol},{pod})，尾箱注入区间=[{tail_pol},{pod}))")
-        for pol in sorted(version2_dict.keys()):
-            if not (host_pol <= pol < pod):
-                continue
-            df1 = version1_dict[pol]
-            df2 = version2_dict[pol]
-            mask = (df1["bay_idx"] == b0) & (df1["lr"] == lr) & (df1["hd"] == hd)
-            print(f"  POL快照={pol}:")
-            print(f"    version1: {df1[mask][['bay_idx','row_idx','tier_idx','POL','POD','GP_count','RF_count','is_hc']].to_dict('records')}")
-            print(f"    version2: {df2[mask][['bay_idx','row_idx','tier_idx','POL','POD','GP_count','RF_count','is_hc']].to_dict('records')}")
+        print("[OK] 除目标缺口外，其它缺口记录retrofit前后完全一致")
 
 
 def summarize_tail_by_port(tail_list: list, original_cbf: dict, port_names: dict = None) -> list:
@@ -1290,14 +917,6 @@ if __name__ == "__main__":
         }, f)
     print(f"\nfixture已落盘: {fixture_path}")
 
-    try:
-        verify_scan_host_candidates()
-    except Exception:
-        # 已知问题（跟本次尾箱统计口径修复无关，见build_host_discharged_scenario
-        # 调用处的TODO注释）：不在这里修，只是不让它中断脚本、挡住后面几个函数。
-        import traceback
-        traceback.print_exc()
-        print("\n[跳过] verify_scan_host_candidates出现已知问题(见TODO注释)，"
-              "继续跑后面的verify函数")
-    verify_match_tails_to_hosts()
-    verify_apply_tail_placements()
+    verify_scan_host_candidates()
+    verify_host_compatible()
+    verify_retrofit_tail_placements()

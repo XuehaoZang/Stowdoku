@@ -30,6 +30,7 @@ from utils.vessel_io import (
 from VesselClass import Vessel
 from CSP_solver import solve, reset_small_pod_ci_stats, _small_pod_ci_stats
 from utils.evaluate import evaluate_crane_time, evaluate_pod_discharge_spread
+from utils.tail import build_tail_container_list, retrofit_tail_placements
 
 GEOMETRY_ALL_CSV = "data/STSE/geometry/all_slots.csv"
 GEOMETRY_REEFER_CSV = "data/STSE/geometry/reefer_slots.csv"
@@ -88,7 +89,8 @@ def main():
     original_cbf = copy.deepcopy(base_vessel.cbf)
 
     # 实验参数设置
-    seeds = [8245, 2817, 6490, 1757, 4073, 6612, 80, 3991, 6813, 7519]
+    seeds = [8245]
+    # seeds = [8245, 2817, 6490, 1757, 4073, 6612, 80, 3991, 6813, 7519]
     # seeds = [8245, 2817, 6490, 1757, 4073, 6612, 80, 3991, 6813, 7519,
     #      8607, 6950, 3128, 9071, 124, 8300, 1327, 9367, 3274, 7276,
     #      3066, 2166, 1464, 6874, 8985, 5833, 5750, 6326, 4255, 7361,
@@ -215,10 +217,40 @@ def main():
     df_summary = pd.DataFrame(summary_data)
     print(df_summary.to_string(index=False))
 
-    # 你可以在这里导出最优解的 bayplan:
-    
-    best_vessel_for_group.export_bayplan(best_snapshots, BAYPLAN_DIR, original_cbf, port_names=PORT_NAMES,
+    # ── 尾箱retrofit链路：build_tail_container_list -> host扫描+retrofit分配 -> 重新build_tail_container_list ──
+    # retrofit前先deepcopy一份snapshots留底，导出"加尾箱前"bayplan，供跟"加尾箱后"人工对照。
+    snapshots_before = copy.deepcopy(best_snapshots)
+    before_tail_dir = os.path.join(BAYPLAN_DIR, "before_tail")
+    best_vessel_for_group.export_bayplan(snapshots_before, before_tail_dir, original_cbf, port_names=PORT_NAMES,
                                           if_csv=False, if_plot_phy=False, cbf_with_20=cbf_with_20)
+
+    tail_list_before = build_tail_container_list(best_vessel_for_group, best_snapshots, original_cbf)
+    retrofit_slots = retrofit_tail_placements(best_vessel_for_group, best_snapshots, tail_list_before, original_cbf)
+    tail_list_after = build_tail_container_list(
+        best_vessel_for_group, best_snapshots, original_cbf, proj_override=retrofit_slots)
+
+    # retrofit_slots已经是叠加尾箱后的slot级DataFrame，直接走export_bayplan_from_slots导出
+    # "加尾箱后"bayplan，不再经过export_bayplan内部的proj_cell_to_vessel重新投影（那样会
+    # 把retrofit结果覆盖掉，看不出尾箱标签的差异）。
+    after_tail_dir = os.path.join(BAYPLAN_DIR, "after_tail")
+    best_vessel_for_group.export_bayplan_from_slots(retrofit_slots, after_tail_dir, port_names=PORT_NAMES,
+                                                      if_csv=False, if_plot_phy=False)
+
+    tail_by_pod = {}
+    for rec in tail_list_after:
+        type_counts = tail_by_pod.setdefault(rec["POD"], {})
+        type_counts[rec["type"]] = type_counts.get(rec["type"], 0) + rec["count"]
+
+    print("\n================ 按POD甩货明细 ================\n")
+    total_all = 0
+    for pod in sorted(tail_by_pod.keys()):
+        type_counts = tail_by_pod[pod]
+        pod_total = sum(type_counts.values())
+        total_all += pod_total
+        type_str = ", ".join(f"{t}={type_counts[t]}" for t in ("GP", "HC", "RF", "HR") if t in type_counts)
+        port_name = PORT_NAMES.get(pod, str(pod))
+        print(f"  POD={pod}({port_name}): {type_str}  (合计={pod_total})")
+    print(f"  全船甩货总数: {total_all}")
 
 if __name__ == "__main__":
     main()
